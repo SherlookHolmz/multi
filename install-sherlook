@@ -19,41 +19,54 @@ fi
 
 mkdir -p "$INSTALL_DIR"
 
-echo -e "${CYAN}[+] Downloading latest Sherlook Multi...${NC}"
-
-TMP="$INSTALL_DIR/.sherlook.sh.tmp"
+TMP="$(mktemp "$INSTALL_DIR/.sherlook.sh.XXXXXX")"
 trap 'rm -f "$TMP"' EXIT
 
+URL="$REPO/sherlook.sh"
+
+echo -e "${CYAN}[+] Downloading latest Sherlook Multi...${NC}"
+
+download_ok=0
+
 if command -v curl >/dev/null 2>&1; then
-    curl -4 -fL --retry 3 --connect-timeout 10 --max-time 120 \
-        -o "$TMP" "$REPO/sherlook.sh"
+    if curl -4 -fL --retry 3 --retry-delay 1 \
+        --connect-timeout 10 --max-time 120 \
+        -o "$TMP" "$URL"; then
+        download_ok=1
+    fi
 elif command -v wget >/dev/null 2>&1; then
-    wget -4 -q --tries=3 --timeout=20 \
-        -O "$TMP" "$REPO/sherlook.sh"
+    if wget -4 -q --tries=3 --timeout=20 \
+        -O "$TMP" "$URL"; then
+        download_ok=1
+    fi
 else
     echo -e "${RED}[!] curl or wget is required.${NC}"
     exit 1
 fi
 
-[ -s "$TMP" ] || {
-    echo -e "${RED}[!] Downloaded file is empty.${NC}"
+if [ "$download_ok" -ne 1 ] || [ ! -s "$TMP" ]; then
+    echo -e "${RED}[!] Failed to download sherlook.sh${NC}"
     exit 1
-}
+fi
 
 if ! head -n 1 "$TMP" | grep -q '^#!/usr/bin/env bash'; then
-    echo -e "${RED}[!] Downloaded file does not look like sherlook.sh.${NC}"
+    echo -e "${RED}[!] Downloaded file is not a valid Sherlook shell script.${NC}"
+    exit 1
+fi
+
+if ! bash -n "$TMP"; then
+    echo -e "${RED}[!] Downloaded sherlook.sh contains a shell syntax error.${NC}"
     exit 1
 fi
 
 install -m 700 "$TMP" "$TARGET"
-install -m 755 "$TARGET" "$BIN"
+install -m 755 "$TMP" "$BIN"
 
-rm -f "$INSTALL_DIR/.sherlook.sh.tmp"
+rm -f "$TMP"
 trap - EXIT
 
 echo
 echo -e "${GREEN}[+] Sherlook Multi updated successfully.${NC}"
-echo -e "${GREEN}[+] Installed: $BIN${NC}"
-echo -e "${YELLOW}[!] Existing Tor node data/configurations were not removed.${NC}"
+echo -e "${GREEN}[+] Command: sherlook${NC}"
+echo -e "${YELLOW}[!] Existing Tor node data/configurations were preserved.${NC}"
 echo
-echo -e "${CYAN}Run:${NC} sherlook"
