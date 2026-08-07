@@ -51,6 +51,12 @@ declare -A NODES=(
     [57]="EE:Estonia:9136" [58]="SI:Slovenia:9137" [59]="SK:Slovakia:9138"
     [60]="RS:Serbia:9139" [61]="GE:Georgia:9140" [62]="KZ:Kazakhstan:9141"
     [63]="AE:United Arab Emirates:9142" [64]="SA:Saudi Arabia:9143" [65]="QA:Qatar:9144"
+    [66]="AL:Albania:9145" [67]="BA:Bosnia and Herzegovina:9146" [68]="BD:Bangladesh:9147"
+    [69]="CO:Colombia:9148" [70]="EC:Ecuador:9149" [71]="GT:Guatemala:9150"
+    [72]="KE:Kenya:9151" [73]="MA:Morocco:9152" [74]="NG:Nigeria:9153"
+    [75]="NZ:New Zealand:9154" [76]="PE:Peru:9155" [77]="PK:Pakistan:9156"
+    [78]="LK:Sri Lanka:9157" [79]="UY:Uruguay:9158" [80]="VE:Venezuela:9159"
+    [81]="PA:Panama:9160" [82]="DO:Dominican Republic:9161" [83]="BO:Bolivia:9162"
 )
 
 declare -A EMOJIS=(
@@ -65,6 +71,9 @@ declare -A EMOJIS=(
     [HR]="🇭🇷" [TN]="🇹🇳" [BR]="🇧🇷" [PH]="🇵🇭" [TH]="🇹🇭" [EG]="🇪🇬"
     [LV]="🇱🇻" [LT]="🇱🇹" [EE]="🇪🇪" [SI]="🇸🇮" [SK]="🇸🇰" [RS]="🇷🇸"
     [GE]="🇬🇪" [KZ]="🇰🇿" [AE]="🇦🇪" [SA]="🇸🇦" [QA]="🇶🇦"
+    [AL]="🇦🇱" [BA]="🇧🇦" [BD]="🇧🇩" [CO]="🇨🇴" [EC]="🇪🇨" [GT]="🇬🇹"
+    [KE]="🇰🇪" [MA]="🇲🇦" [NG]="🇳🇬" [NZ]="🇳🇿" [PE]="🇵🇪" [PK]="🇵🇰"
+    [LK]="🇱🇰" [UY]="🇺🇾" [VE]="🇻🇪" [PA]="🇵🇦" [DO]="🇩🇴" [BO]="🇧🇴"
 )
 
 # Countries known to usually have very few Tor exit relays. We still allow
@@ -74,7 +83,7 @@ declare -A LOW_SUPPLY_WARN=(
     [IS]=1 [SC]=1 [AZ]=1 [MD]=1 [CY]=1 [TN]=1 [GE]=1 [KZ]=1 [QA]=1 [SA]=1 [AE]=1 [CR]=1
 )
 
-ORDER=({01..65})
+ORDER=({01..83})
 
 # ================= CORE FUNCTIONS =================
 
@@ -92,68 +101,49 @@ check_root() {
 check_ip_quality() {
     local ip="$1"
     local expected_cc="${2^^}"
+    local tmpdir
+    tmpdir=$(mktemp -d /tmp/sherlook_geo.XXXXXX) || { echo "1||GEOIP_UNAVAILABLE|"; return; }
+
+    curl -4 -sS --connect-timeout 3 --max-time 6 "https://api.ipapi.is/?q=$ip" >"$tmpdir/a" 2>/dev/null & local p1=$!
+    curl -4 -sS --connect-timeout 3 --max-time 6 "https://ipwho.is/$ip" >"$tmpdir/b" 2>/dev/null & local p2=$!
+    curl -4 -sS --connect-timeout 3 --max-time 6 "https://ipapi.co/$ip/json/" >"$tmpdir/c" 2>/dev/null & local p3=$!
+    wait "$p1" "$p2" "$p3" 2>/dev/null || true
 
     local api1 api2 api3 cc1 cc2 cc3
-    api1=$(curl -4 -sS --connect-timeout 5 --max-time 10 "https://api.ipapi.is/?q=$ip" 2>/dev/null || true)
-    api2=$(curl -4 -sS --connect-timeout 5 --max-time 10 "https://ipwho.is/$ip" 2>/dev/null || true)
-    api3=$(curl -4 -sS --connect-timeout 5 --max-time 10 "https://ipapi.co/$ip/json/" 2>/dev/null || true)
+    api1=$(cat "$tmpdir/a" 2>/dev/null || true)
+    api2=$(cat "$tmpdir/b" 2>/dev/null || true)
+    api3=$(cat "$tmpdir/c" 2>/dev/null || true)
 
     cc1=$(echo "$api1" | jq -r '.location.country_code // .country_code // empty' 2>/dev/null | tr '[:lower:]' '[:upper:]')
     cc2=$(echo "$api2" | jq -r '.country_code // .countryCode // empty' 2>/dev/null | tr '[:lower:]' '[:upper:]')
     cc3=$(echo "$api3" | jq -r '.country_code // empty' 2>/dev/null | tr '[:lower:]' '[:upper:]')
 
-    local abuser_line
-    abuser_line=$(echo "$api1" | grep -i '"abuser_score"' | head -n1 || true)
-
-    # Fail closed: if a source explicitly says the IP belongs to another
-    # country, reject it. If all sources fail, do NOT accept the IP as verified.
-    local mismatch=0
-    local verified=0
-
+    local verified=0 mismatch=0 high_risk=0
     for cc in "$cc1" "$cc2" "$cc3"; do
         if [ -n "$cc" ]; then
             verified=1
-            if [ "$cc" != "$expected_cc" ]; then
-                mismatch=1
-            fi
+            [ "$cc" != "$expected_cc" ] && mismatch=1
         fi
     done
+    if echo "$api1" | grep -iq '"abuser_score".*"High"'; then high_risk=1; fi
 
-    local high_risk=0
-    if echo "$abuser_line" | grep -iq "High"; then
-        high_risk=1
-    fi
+    local bad=0 reason=""
+    if [ "$verified" -eq 0 ]; then bad=1; reason="GEOIP_UNAVAILABLE"
+    elif [ "$mismatch" -eq 1 ]; then bad=1; reason="COUNTRY_MISMATCH"
+    elif [ "$high_risk" -eq 1 ]; then bad=1; reason="HIGH_RISK"
+    else reason="VERIFIED"; fi
 
-    local bad=0
-    local reason=""
-
-    if [ "$verified" -eq 0 ]; then
-        bad=1
-        reason="GEOIP_UNAVAILABLE"
-    elif [ "$mismatch" -eq 1 ]; then
-        bad=1
-        reason="COUNTRY_MISMATCH"
-    elif [ "$high_risk" -eq 1 ]; then
-        bad=1
-        reason="HIGH_RISK"
-    else
-        reason="VERIFIED"
-    fi
-
-    # Return: bad|actual_cc|reason|all_seen_ccs
     local actual_cc=""
     if [ -n "$cc1" ]; then actual_cc="$cc1"
     elif [ -n "$cc2" ]; then actual_cc="$cc2"
-    elif [ -n "$cc3" ]; then actual_cc="$cc3"
-    fi
+    elif [ -n "$cc3" ]; then actual_cc="$cc3"; fi
 
     local seen=""
     for cc in "$cc1" "$cc2" "$cc3"; do
-        if [ -n "$cc" ]; then
-            if [ -z "$seen" ]; then seen="$cc"; else seen="$seen,$cc"; fi
-        fi
+        [ -z "$cc" ] && continue
+        [ -z "$seen" ] && seen="$cc" || seen="$seen,$cc"
     done
-
+    rm -rf "$tmpdir"
     echo "${bad}|${actual_cc}|${reason}|${seen}"
 }
 
@@ -435,6 +425,139 @@ EOF
     return 1
 }
 
+# ================= IP ROTATION =================
+get_node_ip() {
+    local out_port="$1"
+    curl -4 -sS --socks5-hostname "127.0.0.1:${out_port}" \
+      https://api.ipify.org --connect-timeout 3 --max-time 7 2>/dev/null | tr -d '\r\n\0'
+}
+
+rotate_one_node() {
+    local code="$1" name="$2" out_port="$3" silent="${4:-0}"
+    local conf_file="$BASE_DIR/node_${code}_${out_port}.conf"
+    local inst_data_dir="$DATA_DIR/${code}_${out_port}"
+    local ctrl_file="$inst_data_dir/control.env"
+    local bad_file="$inst_data_dir/bad_exits.txt"
+    local ip_file="$inst_data_dir/last_ip.txt"
+    [ -f "$conf_file" ] && [ -f "$ctrl_file" ] || return 2
+
+    source "$ctrl_file" 2>/dev/null || return 2
+    local old_ip=""
+    [ -s "$ip_file" ] && old_ip=$(head -n1 "$ip_file" | tr -d '\r\n')
+    [ "$silent" = "1" ] || echo -e "${CYAN}🔄 $code - $name: changing IP...${NC}"
+
+    # Fast path: NEWNYM on this node's own Tor instance.
+    send_newnym "$CTRL_PORT" "$CTRL_PASS" || true
+
+    local attempt new_ip result bad actual reason seen
+    for attempt in {1..6}; do
+        sleep 3
+        new_ip=$(get_node_ip "$out_port")
+        if [[ "$new_ip" =~ ^[0-9]+(\.[0-9]+){3}$ ]] && [ "$new_ip" != "$old_ip" ]; then
+            result=$(check_ip_quality "$new_ip" "$code")
+            IFS='|' read -r bad actual reason seen <<< "$result"
+            if [ "$bad" = "0" ]; then
+                echo "$new_ip" > "$ip_file"
+                [ "$silent" = "1" ] || echo -e "${GREEN}  ✓ $code → $new_ip${NC}"
+                return 0
+            fi
+            if [ "$reason" = "COUNTRY_MISMATCH" ] || [ "$reason" = "HIGH_RISK" ]; then
+                mkdir -p "$inst_data_dir"; touch "$bad_file"
+                grep -qxF "$new_ip" "$bad_file" 2>/dev/null || echo "$new_ip" >> "$bad_file"
+                sort -u -o "$bad_file" "$bad_file" 2>/dev/null || true
+            fi
+        fi
+        send_newnym "$CTRL_PORT" "$CTRL_PASS" || true
+    done
+
+    # Slow path: rebuild only this Tor instance with the previous exit excluded.
+    [ -n "$old_ip" ] && {
+        touch "$bad_file"
+        grep -qxF "$old_ip" "$bad_file" 2>/dev/null || echo "$old_ip" >> "$bad_file"
+    }
+    write_node_conf "$conf_file" "$out_port" "$CTRL_PORT" "$HASHED_PASS" "$inst_data_dir" "$code"
+    pkill -f "node_${code}_${out_port}.conf" 2>/dev/null || true
+    sleep 1
+    sudo -u debian-tor tor -f "$conf_file" >/dev/null 2>&1 &
+
+    for attempt in {1..8}; do
+        sleep 2
+        new_ip=$(get_node_ip "$out_port")
+        if [[ "$new_ip" =~ ^[0-9]+(\.[0-9]+){3}$ ]] && [ "$new_ip" != "$old_ip" ]; then
+            result=$(check_ip_quality "$new_ip" "$code")
+            IFS='|' read -r bad actual reason seen <<< "$result"
+            if [ "$bad" = "0" ]; then
+                echo "$new_ip" > "$ip_file"
+                [ "$silent" = "1" ] || echo -e "${GREEN}  ✓ $code → $new_ip${NC}"
+                return 0
+            fi
+            if [ "$reason" = "COUNTRY_MISMATCH" ] || [ "$reason" = "HIGH_RISK" ]; then
+                touch "$bad_file"
+                grep -qxF "$new_ip" "$bad_file" 2>/dev/null || echo "$new_ip" >> "$bad_file"
+                sort -u -o "$bad_file" "$bad_file" 2>/dev/null || true
+            fi
+            write_node_conf "$conf_file" "$out_port" "$CTRL_PORT" "$HASHED_PASS" "$inst_data_dir" "$code"
+            pkill -f "node_${code}_${out_port}.conf" 2>/dev/null || true
+            sleep 1
+            sudo -u debian-tor tor -f "$conf_file" >/dev/null 2>&1 &
+        fi
+    done
+    [ "$silent" = "1" ] || echo -e "${RED}  ✗ $code: no verified new IP found.${NC}"
+    return 1
+}
+
+change_ip_menu() {
+    check_root
+    while true; do
+        draw_header
+        echo -e "${MAGENTA}🔄 IP Rotation${NC}"
+        echo -e "${BLUE}────────────────────────────────────────────────────────────${NC}"
+        echo -e "  ${CYAN}[1]${NC} Change IP of one active Node"
+        echo -e "  ${CYAN}[2]${NC} Change IP of ALL active Nodes"
+        echo -e "  ${RED}[0]${NC} Back"
+        echo -e "${BLUE}────────────────────────────────────────────────────────────${NC}"
+        read -r -p "Enter choice: " ch < /dev/tty || return
+        case "$ch" in
+            1)
+                for idx in "${ORDER[@]}"; do
+                    IFS=':' read -r code name out_port <<< "${NODES[$idx]}"
+                    if [ -f "$BASE_DIR/node_${code}_${out_port}.conf" ] && pgrep -f "node_${code}_${out_port}.conf" >/dev/null 2>&1; then
+                        echo -e "  ${CYAN}[$idx]${NC} ${EMOJIS[$code]} $name ($code) — $out_port"
+                    fi
+                done
+                read -r -p "Node ID: " pick < /dev/tty || continue
+                IFS=':' read -r code name out_port <<< "${NODES[$pick]:-}"
+                if [ -n "$code" ] && [ -f "$BASE_DIR/node_${code}_${out_port}.conf" ]; then
+                    rotate_one_node "$code" "$name" "$out_port" 0
+                else
+                    echo -e "${RED}[!] Invalid/inactive Node.${NC}"
+                fi
+                read -r -p "Press Enter..." < /dev/tty
+                ;;
+            2)
+                local jobs=0 total=0 max_jobs=6
+                echo -e "${YELLOW}[*] Rotating all active Nodes (up to $max_jobs in parallel)...${NC}"
+                for idx in "${ORDER[@]}"; do
+                    IFS=':' read -r code name out_port <<< "${NODES[$idx]}"
+                    if [ -f "$BASE_DIR/node_${code}_${out_port}.conf" ] && pgrep -f "node_${code}_${out_port}.conf" >/dev/null 2>&1; then
+                        total=$((total+1))
+                        rotate_one_node "$code" "$name" "$out_port" 1 &
+                        jobs=$((jobs+1))
+                        if [ "$jobs" -ge "$max_jobs" ]; then
+                            wait -n 2>/dev/null || wait
+                            jobs=$((jobs-1))
+                        fi
+                    fi
+                done
+                wait || true
+                echo -e "${GREEN}[+] Bulk IP rotation finished for $total active Node(s).${NC}"
+                read -r -p "Press Enter..." < /dev/tty
+                ;;
+            0) return ;;
+        esac
+    done
+}
+
 # ================= CORE MENUS =================
 
 install_engine() {
@@ -565,7 +688,7 @@ bulk_add_nodes() {
             sleep 1
         done
         echo -e "\n${GREEN}[+] Full deployment sequence complete!${NC}"
-        read -p "$(echo -e ${WHITE}"Press Enter to return to main menu..."${NC})"
+        read -r -p "$(echo -e ${WHITE}"Press Enter to return to main menu..."${NC})" < /dev/tty
 
     elif [ "$bulk_opt" == "2" ]; then
         list_locations
@@ -593,7 +716,7 @@ bulk_add_nodes() {
             fi
         done
         echo -e "\n${GREEN}[+] Custom batch deployment sequence complete!${NC}"
-        read -p "$(echo -e ${WHITE}"Press Enter to return to main menu..."${NC})"
+        read -r -p "$(echo -e ${WHITE}"Press Enter to return to main menu..."${NC})" < /dev/tty
 
     elif [ "$bulk_opt" == "3" ]; then
         echo -e "${YELLOW}[!] Initiating deployment for Main Countries...${NC}"
@@ -611,7 +734,7 @@ bulk_add_nodes() {
             sleep 1
         done
         echo -e "\n${GREEN}[+] Main Countries deployment sequence complete!${NC}"
-        read -p "$(echo -e ${WHITE}"Press Enter to return to main menu..."${NC})"
+        read -r -p "$(echo -e ${WHITE}"Press Enter to return to main menu..."${NC})" < /dev/tty
     fi
 }
 
@@ -1194,7 +1317,7 @@ panel_batch_create() {
     echo -e "💡 ${CYAN}Note: Restarting the Xray Core from your panel is highly recommended to apply changes.${NC}"
     echo -e "${BLUE}────────────────────────────────────────────────────────────${NC}\n"
 
-    read -p "$(echo -e ${WHITE}"Press [Enter] to continue..."${NC})"
+    read -r -p "$(echo -e ${WHITE}"Press [Enter] to continue..."${NC})" < /dev/tty
 }
 
 # ================= MENU LOOP =================
@@ -1214,21 +1337,22 @@ while true; do
     echo -e "  ${GREEN}[5]${NC} ${WHITE}»${NC} Bulk Add Nodes (Multiple/All)"
     echo -e "  ${GREEN}[6]${NC} ${WHITE}»${NC} View Active Nodes"
     echo -e "  ${GREEN}[7]${NC} ${WHITE}»${NC} Edit or Delete Nodes"
-    echo -e "  ${CYAN}[8]${NC} ${WHITE}»${NC} Advanced Port Settings"
+    echo -e "  ${CYAN}[8]${NC} ${WHITE}»${NC} 🔄 Change IP / IP Rotation"
     echo -e "${BLUE} ────────────────────────────────────────────────────────${NC}"
     echo -e "  ${YELLOW}[9]${NC} ${WHITE}»${NC} Panel Pasarguard Integration"
     echo -e "${BLUE} ────────────────────────────────────────────────────────${NC}"
     echo -e "  ${RED}[0]${NC} ${WHITE}»${NC} Exit Program"
     echo -e "${BLUE} ────────────────────────────────────────────────────────${NC}\n"
 
-    if ! read -p "$(echo -e ${MAGENTA}"Enter choice [0-9]: "${NC})" main_choice; then
+    if ! read -r -p "$(echo -e ${MAGENTA}"Enter choice [0-9]: "${NC})" main_choice < /dev/tty; then
         echo -e "\n${RED}[!] No terminal input available (are you piping this, e.g. curl | bash?). Exiting.${NC}"
         exit 1
     fi
 
     case $main_choice in
         1) install_engine ;;
-        2|8) echo -e "${YELLOW}[!] This feature is currently locked for this tier.${NC}"; sleep 2 ;;
+        2) echo -e "${YELLOW}[!] This feature is currently locked for this tier.${NC}"; sleep 2 ;;
+        8) change_ip_menu ;;
         3) uninstall_engine ;;
         4) add_single_node ;;
         5) bulk_add_nodes ;;
