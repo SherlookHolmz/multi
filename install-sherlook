@@ -1,31 +1,59 @@
-#!/bin/bash
-set -e
+#!/usr/bin/env bash
+set -euo pipefail
 
 REPO="https://raw.githubusercontent.com/SherlookHolmz/multi/main"
 INSTALL_DIR="/root/.sherlook"
+TARGET="$INSTALL_DIR/sherlook.sh"
+BIN="/usr/local/bin/sherlook"
 
-echo "[+] Installing Sherlook Multi..."
+GREEN='\033[1;32m'
+YELLOW='\033[1;33m'
+RED='\033[1;31m'
+CYAN='\033[1;36m'
+NC='\033[0m'
+
+if [ "${EUID:-$(id -u)}" -ne 0 ]; then
+    echo -e "${RED}[!] Run this installer as root.${NC}"
+    exit 1
+fi
+
 mkdir -p "$INSTALL_DIR"
 
-echo "[+] Downloading sherlook.sh..."
-curl -fL --retry 3 --connect-timeout 15 \
-  -o "$INSTALL_DIR/sherlook.sh" \
-  "$REPO/sherlook.sh"
+echo -e "${CYAN}[+] Downloading latest Sherlook Multi...${NC}"
 
-chmod +x "$INSTALL_DIR/sherlook.sh"
+TMP="$INSTALL_DIR/.sherlook.sh.tmp"
+trap 'rm -f "$TMP"' EXIT
 
-echo "[+] Creating sherlook command..."
+if command -v curl >/dev/null 2>&1; then
+    curl -4 -fL --retry 3 --connect-timeout 10 --max-time 120 \
+        -o "$TMP" "$REPO/sherlook.sh"
+elif command -v wget >/dev/null 2>&1; then
+    wget -4 -q --tries=3 --timeout=20 \
+        -O "$TMP" "$REPO/sherlook.sh"
+else
+    echo -e "${RED}[!] curl or wget is required.${NC}"
+    exit 1
+fi
 
-cat > /usr/local/bin/sherlook <<EOF
-#!/bin/bash
-exec "$INSTALL_DIR/sherlook.sh" "\$@"
-EOF
+[ -s "$TMP" ] || {
+    echo -e "${RED}[!] Downloaded file is empty.${NC}"
+    exit 1
+}
 
-chmod +x /usr/local/bin/sherlook
+if ! head -n 1 "$TMP" | grep -q '^#!/usr/bin/env bash'; then
+    echo -e "${RED}[!] Downloaded file does not look like sherlook.sh.${NC}"
+    exit 1
+fi
+
+install -m 700 "$TMP" "$TARGET"
+install -m 755 "$TARGET" "$BIN"
+
+rm -f "$INSTALL_DIR/.sherlook.sh.tmp"
+trap - EXIT
 
 echo
-echo "[+] Sherlook Multi installed successfully."
+echo -e "${GREEN}[+] Sherlook Multi updated successfully.${NC}"
+echo -e "${GREEN}[+] Installed: $BIN${NC}"
+echo -e "${YELLOW}[!] Existing Tor node data/configurations were not removed.${NC}"
 echo
-echo "Run:"
-echo "  sherlook"
-echo
+echo -e "${CYAN}Run:${NC} sherlook"
