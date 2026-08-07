@@ -1,52 +1,31 @@
 #!/bin/bash
 set -e
 
-REPO="https://raw.githubusercontent.com/SherlookHolmz/sherlook-host.py/main"
-INSTALL_DIR="$HOME/.sherlook-host"
-BIN_DIR="$HOME/bin"
-APP="$INSTALL_DIR/sherlook-host.py"
+REPO="https://raw.githubusercontent.com/SherlookHolmz/multi/main"
+INSTALL_DIR="/root/.sherlook"
 
-echo "[+] Installing Sherlook Host Manager..."
-mkdir -p "$INSTALL_DIR" "$BIN_DIR"
+echo "[+] Installing Sherlook Multi..."
+mkdir -p "$INSTALL_DIR"
 
-echo "[+] Downloading sherlook-host.py..."
+echo "[+] Downloading sherlook.sh..."
 curl -fL --retry 3 --connect-timeout 15 \
-  -o "$APP" \
-  "$REPO/sherlook-host.py"
+  -o "$INSTALL_DIR/sherlook.sh" \
+  "$REPO/sherlook.sh"
 
-chmod 700 "$INSTALL_DIR"
-chmod 700 "$APP"
+chmod +x "$INSTALL_DIR/sherlook.sh"
 
-echo "[+] Installing PasarGuard dependency..."
-python3 -m pip install --quiet --break-system-packages pasarguard 2>/dev/null || \
-python3 -m pip install --quiet --user pasarguard
+echo "[+] Creating sherlook command..."
 
-echo "[+] Creating 'sherlook-host' command..."
-cat > "$BIN_DIR/sherlook-host" <<EOF
+cat > /usr/local/bin/sherlook <<EOF
 #!/bin/bash
-exec python3 "$APP" "\$@"
+exec "$INSTALL_DIR/sherlook.sh" "\$@"
 EOF
 
-chmod 755 "$BIN_DIR/sherlook-host"
-
-if [ -f "$HOME/.bashrc" ]; then
-    grep -qxF 'export PATH="$HOME/bin:$PATH"' "$HOME/.bashrc" 2>/dev/null || \
-        echo 'export PATH="$HOME/bin:$PATH"' >> "$HOME/.bashrc"
-fi
-
-export PATH="$HOME/bin:$PATH"
+chmod +x /usr/local/bin/sherlook
 
 echo
-echo "=========================================="
-echo "     SHERLOOK HOST MANAGER INSTALLED"
-echo "=========================================="
+echo "[+] Sherlook Multi installed successfully."
 echo
 echo "Run:"
-echo "  sherlook-host"
-echo
-echo "If the command is not found:"
-echo "  source ~/.bashrc"
-echo
-echo "Installed:"
-echo "  $APP"
+echo "  sherlook"
 echo
