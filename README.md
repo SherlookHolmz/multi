@@ -19,8 +19,7 @@
 
 ### 🚀 **اسکریپت آسان نصب**
 
-```bash
-wget -qO- https://raw.githubusercontent.com/SherlookHolmz/multi/main/sherlook.sh | bash
+```bash <(wget -qO- https://raw.githubusercontent.com/SherlookHolmz/multi/main/sherlook.sh)
 
 ```
 
