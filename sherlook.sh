@@ -20,10 +20,12 @@ DATA_DIR="/var/lib/tor/sherlook_nodes"
 PANEL_CONF="$BASE_DIR/pasargad_panel.conf"
 
 # How many "country mismatch / high-abuse" retries before we give up on a fresh deploy
-MAX_QUALITY_ATTEMPTS=6
+MAX_QUALITY_ATTEMPTS=8
 # How many quick NEWNYM (new circuit, no restart) tries before we escalate to
 # excluding the bad exit IP and doing a full restart
 MAX_NEWNYM_TRIES=2
+# Maximum total public-IP validation cycles for one node deployment
+MAX_TOTAL_VALIDATION_ATTEMPTS=30
 
 # Format: "CountryCode : CountryName : TorPort"
 declare -A NODES=(
@@ -89,26 +91,70 @@ check_root() {
 # Tor's own consensus GeoIP database claims for the exit relay's country.
 check_ip_quality() {
     local ip="$1"
-    local expected_cc="$2"
-    local api_resp
-    api_resp=$(curl -s "https://api.ipapi.is/?q=$ip" --connect-timeout 4 --max-time 8 || true)
+    local expected_cc="${2^^}"
 
-    local actual_cc
-    actual_cc=$(echo "$api_resp" | jq -r '.location.country_code // .location.country // empty' 2>/dev/null)
-    actual_cc="${actual_cc^^}"
+    local api1 api2 api3 cc1 cc2 cc3
+    api1=$(curl -4 -sS --connect-timeout 5 --max-time 10 "https://api.ipapi.is/?q=$ip" 2>/dev/null || true)
+    api2=$(curl -4 -sS --connect-timeout 5 --max-time 10 "https://ipwho.is/$ip" 2>/dev/null || true)
+    api3=$(curl -4 -sS --connect-timeout 5 --max-time 10 "https://ipapi.co/$ip/json/" 2>/dev/null || true)
+
+    cc1=$(echo "$api1" | jq -r '.location.country_code // .country_code // empty' 2>/dev/null | tr '[:lower:]' '[:upper:]')
+    cc2=$(echo "$api2" | jq -r '.country_code // .countryCode // empty' 2>/dev/null | tr '[:lower:]' '[:upper:]')
+    cc3=$(echo "$api3" | jq -r '.country_code // empty' 2>/dev/null | tr '[:lower:]' '[:upper:]')
 
     local abuser_line
-    abuser_line=$(echo "$api_resp" | grep -i '"abuser_score"' | head -n1)
+    abuser_line=$(echo "$api1" | grep -i '"abuser_score"' | head -n1 || true)
+
+    # Fail closed: if a source explicitly says the IP belongs to another
+    # country, reject it. If all sources fail, do NOT accept the IP as verified.
+    local mismatch=0
+    local verified=0
+
+    for cc in "$cc1" "$cc2" "$cc3"; do
+        if [ -n "$cc" ]; then
+            verified=1
+            if [ "$cc" != "$expected_cc" ]; then
+                mismatch=1
+            fi
+        fi
+    done
+
+    local high_risk=0
+    if echo "$abuser_line" | grep -iq "High"; then
+        high_risk=1
+    fi
 
     local bad=0
-    if [ -n "$actual_cc" ] && [ "$actual_cc" != "${expected_cc^^}" ]; then
+    local reason=""
+
+    if [ "$verified" -eq 0 ]; then
         bad=1
-    fi
-    if echo "$abuser_line" | grep -iq "High"; then
+        reason="GEOIP_UNAVAILABLE"
+    elif [ "$mismatch" -eq 1 ]; then
         bad=1
+        reason="COUNTRY_MISMATCH"
+    elif [ "$high_risk" -eq 1 ]; then
+        bad=1
+        reason="HIGH_RISK"
+    else
+        reason="VERIFIED"
     fi
 
-    echo "${bad}|${actual_cc}"
+    # Return: bad|actual_cc|reason|all_seen_ccs
+    local actual_cc=""
+    if [ -n "$cc1" ]; then actual_cc="$cc1"
+    elif [ -n "$cc2" ]; then actual_cc="$cc2"
+    elif [ -n "$cc3" ]; then actual_cc="$cc3"
+    fi
+
+    local seen=""
+    for cc in "$cc1" "$cc2" "$cc3"; do
+        if [ -n "$cc" ]; then
+            if [ -z "$seen" ]; then seen="$cc"; else seen="$seen,$cc"; fi
+        fi
+    done
+
+    echo "${bad}|${actual_cc}|${reason}|${seen}"
 }
 
 # Ask the running Tor instance for a brand-new circuit (fast, no restart).
@@ -135,7 +181,7 @@ write_node_conf() {
 
     if [ -s "$bad_file" ]; then
         local bad_list
-        bad_list=$(paste -sd, "$bad_file" 2>/dev/null)
+        bad_list=$(grep -E '^[0-9]{1,3}(\.[0-9]{1,3}){3}(/([0-9]|[12][0-9]|3[0-2]))?$' "$bad_file" | paste -sd, - 2>/dev/null || true)
         if [ -n "$bad_list" ]; then
             exclude_line="ExcludeExitNodes $bad_list"
         fi
@@ -146,6 +192,7 @@ SocksPort 0.0.0.0:$out_port
 ControlPort 127.0.0.1:$control_port
 HashedControlPassword $hashed_pass
 DataDirectory $inst_data_dir
+GeoIPExcludeUnknown 1
 ExitNodes {$code}
 StrictNodes 1
 $exclude_line
@@ -195,12 +242,11 @@ background_auto_heal() {
                 result=$(check_ip_quality "$test_ip" "$code")
                 local bad="${result%%|*}"
                 if [ "$bad" == "1" ]; then
-                    echo "$test_ip" >> "$bad_file"
-                    sort -u -o "$bad_file" "$bad_file" 2>/dev/null || true
-                    if [ -n "$control_port" ] && [ -n "$ctrl_pass" ]; then
-                        send_newnym "$control_port" "$ctrl_pass"
+                    if ! grep -qxF "$test_ip" "$bad_file" 2>/dev/null; then
+                        echo "$test_ip" >> "$bad_file"
+                        sort -u -o "$bad_file" "$bad_file" 2>/dev/null || true
                     fi
-                    is_dead=1  # force a conf rewrite + restart below to apply the exclude list
+                    is_dead=1  # force conf rewrite + restart; wrong-country IP is never cached
                 else
                     echo "$test_ip" > "$ip_file"
                 fi
@@ -219,8 +265,19 @@ background_auto_heal() {
                 sleep 15
                 local new_ip
                 new_ip=$(curl -s --socks5-hostname 127.0.0.1:"$out_port" https://api.ipify.org --max-time 15 || true)
-                if [[ "$new_ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-                    echo "$new_ip" > "$ip_file"
+                if [[ "$new_ip" =~ ^[0-9]+(\.[0-9]+){3}$ ]]; then
+                    local heal_result heal_bad
+                    heal_result=$(check_ip_quality "$new_ip" "$code")
+                    heal_bad="${heal_result%%|*}"
+                    if [ "$heal_bad" == "0" ]; then
+                        echo "$new_ip" > "$ip_file"
+                    else
+                        if ! grep -qxF "$new_ip" "$bad_file" 2>/dev/null; then
+                            echo "$new_ip" >> "$bad_file"
+                            sort -u -o "$bad_file" "$bad_file" 2>/dev/null || true
+                        fi
+                        rm -f "$ip_file"
+                    fi
                 fi
             ) &
         fi
@@ -267,24 +324,20 @@ deploy_node() {
     local inst_data_dir="$DATA_DIR/${code}_${out_port}"
     local ip_file="$inst_data_dir/last_ip.txt"
     local ctrl_file="$inst_data_dir/control.env"
+    local bad_file="$inst_data_dir/bad_exits.txt"
 
-    mkdir -p "$BASE_DIR"
-    mkdir -p "$inst_data_dir"
+    mkdir -p "$BASE_DIR" "$inst_data_dir"
+    touch "$bad_file"
     chown -R debian-tor:debian-tor "$inst_data_dir" 2>/dev/null || true
 
     if [ -n "${LOW_SUPPLY_WARN[$code]:-}" ]; then
         echo -e "${YELLOW}[!] Heads up: $name usually has very few Tor exit relays.${NC}"
-        echo -e "${YELLOW}    That's often the exact cause of 'wrong country IP' — there may be${NC}"
-        echo -e "${YELLOW}    only 1-2 exits to choose from, and geo-databases disagree on them.${NC}"
-        echo -e "${YELLOW}    This build will auto-exclude bad exits going forward, but a pool${NC}"
-        echo -e "${YELLOW}    this small can still be slow to find a correct match.${NC}"
+        echo -e "${YELLOW}    The node will NOT be accepted unless the public IP verifies as $code.${NC}"
     fi
 
-    # Set up (or reuse) a control-port password so we can send NEWNYM
-    # without a full process restart. Persisted per node in control.env.
     local ctrl_pass hashed_pass control_port
     if [ -f "$ctrl_file" ]; then
-        source "$ctrl_file"
+        source "$ctrl_file" 2>/dev/null || true
         ctrl_pass="$CTRL_PASS"
         hashed_pass="$HASHED_PASS"
         control_port="$CTRL_PORT"
@@ -305,6 +358,7 @@ EOF
 
     if pgrep -f "node_${code}_${out_port}.conf" > /dev/null; then
         pkill -f "node_${code}_${out_port}.conf" 2>/dev/null || true
+        sleep 2
     fi
 
     echo -e "${CYAN}[*] Routing ${WHITE}$code - $name ${CYAN}➔ Tor Port: ${MAGENTA}$out_port${CYAN}. Please wait...${NC}"
@@ -312,67 +366,73 @@ EOF
     draw_progress "Bootstrapping Tor connection"
 
     local connect_attempts=0
-    local max_connect_attempts=20
-    local quality_attempts=0
+    local total_attempts=0
     local newnym_tries=0
+    local last_ip=""
 
-    while [ $connect_attempts -lt $max_connect_attempts ]; do
+    while [ "$total_attempts" -lt "$MAX_TOTAL_VALIDATION_ATTEMPTS" ]; do
         local public_ip
-        public_ip=$(curl -s --socks5-hostname 127.0.0.1:"$out_port" https://api.ipify.org --connect-timeout 4 --max-time 8 | tr -d '\0' || true)
+        public_ip=$(curl -4 -sS --socks5-hostname 127.0.0.1:"$out_port" https://api.ipify.org --connect-timeout 5 --max-time 12 | tr -d '\0\r\n' || true)
 
-        if [ -n "$public_ip" ] && [[ "$public_ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-
-            echo -e "${CYAN}[*] Checking IP Reputation & Country for ${MAGENTA}$public_ip${CYAN}...${NC}"
-            local result
-            result=$(check_ip_quality "$public_ip" "$code")
-            local is_bad="${result%%|*}"
-            local actual_cc="${result##*|}"
-
-            if [ "$is_bad" == "0" ] || [ $quality_attempts -ge $MAX_QUALITY_ATTEMPTS ]; then
-                if [ "$is_bad" == "1" ]; then
-                    echo -e "${YELLOW}[!] Max retries reached ($MAX_QUALITY_ATTEMPTS/$MAX_QUALITY_ATTEMPTS). Forcing acceptance of IP: $public_ip (geo says: ${actual_cc:-unknown})${NC}"
-                else
-                    echo -e "${GREEN}[+] IP is Clean and Country-Verified ($code)!${NC}"
-                fi
-                echo "$public_ip" > "$ip_file"
-                echo -e "${GREEN}[+] Online -> ${WHITE}$code - $name ${GREEN}($public_ip)${NC}\n"
-                return 0
-            fi
-
-            quality_attempts=$((quality_attempts+1))
-            if [ "$actual_cc" != "" ] && [ "$actual_cc" != "${code^^}" ]; then
-                echo -e "${RED}[-] IP $public_ip geolocates to ${actual_cc:-unknown}, not $code! ($quality_attempts/$MAX_QUALITY_ATTEMPTS)${NC}"
-            else
-                echo -e "${RED}[-] IP $public_ip is High Risk! ($quality_attempts/$MAX_QUALITY_ATTEMPTS)${NC}"
-            fi
-
-            if [ $newnym_tries -lt $MAX_NEWNYM_TRIES ]; then
-                # Fast path: ask for a new circuit without restarting Tor.
-                echo -e "${CYAN}    > Requesting a new circuit (NEWNYM)...${NC}"
-                send_newnym "$control_port" "$ctrl_pass"
-                newnym_tries=$((newnym_tries+1))
-                sleep 5
-            else
-                # Slow but permanent path: blacklist this exit IP and reload.
-                echo -e "${YELLOW}    > Excluding this exit IP permanently and restarting...${NC}"
-                echo "$public_ip" >> "$inst_data_dir/bad_exits.txt"
-                sort -u -o "$inst_data_dir/bad_exits.txt" "$inst_data_dir/bad_exits.txt" 2>/dev/null || true
-                write_node_conf "$conf_file" "$out_port" "$control_port" "$hashed_pass" "$inst_data_dir" "$code"
-                pkill -f "node_${code}_${out_port}.conf" 2>/dev/null || true
-                sleep 2
-                sudo -u debian-tor tor -f "$conf_file" >/dev/null 2>&1 &
-                sleep 5
-                newnym_tries=0
-            fi
-            connect_attempts=0
-        else
-            echo -e "${CYAN}[*] Waiting for Tor connection (Attempt $((connect_attempts+1))/$max_connect_attempts)...${NC}"
+        if [ -z "$public_ip" ] || ! [[ "$public_ip" =~ ^[0-9]+(\.[0-9]+){3}$ ]]; then
             connect_attempts=$((connect_attempts+1))
+            total_attempts=$((total_attempts+1))
+            echo -e "${CYAN}[*] Waiting for Tor connection (Attempt $total_attempts/$MAX_TOTAL_VALIDATION_ATTEMPTS)...${NC}"
             sleep 3
+            continue
+        fi
+
+        echo -e "${CYAN}[*] Verifying ${MAGENTA}$public_ip${CYAN} against multiple GeoIP sources for ${WHITE}$code${CYAN}...${NC}"
+        local result is_bad actual_cc reason seen_ccs
+        result=$(check_ip_quality "$public_ip" "$code")
+        IFS='|' read -r is_bad actual_cc reason seen_ccs <<< "$result"
+        total_attempts=$((total_attempts+1))
+
+        if [ "$is_bad" == "0" ]; then
+            echo "$public_ip" > "$ip_file"
+            echo -e "${GREEN}[+] VERIFIED: $public_ip → $code - $name${NC}"
+            echo -e "${GREEN}[+] GeoIP sources: ${seen_ccs}${NC}"
+            echo -e "${GREEN}[+] Online -> ${WHITE}$code - $name ${GREEN}($public_ip)${NC}\n"
+            return 0
+        fi
+
+        echo -e "${RED}[-] Rejected $public_ip: ${reason} | detected=${seen_ccs:-unknown} | expected=$code${NC}"
+
+        # Immediately blacklist a bad public address. Tor accepts address
+        # patterns in ExcludeExitNodes, so this prevents the same exit from
+        # being selected again after NEWNYM/restart.
+        if ! grep -qxF "$public_ip" "$bad_file" 2>/dev/null; then
+            echo "$public_ip" >> "$bad_file"
+            sort -u -o "$bad_file" "$bad_file" 2>/dev/null || true
+        fi
+
+        if [ "$public_ip" == "$last_ip" ]; then
+            newnym_tries=$MAX_NEWNYM_TRIES
+        fi
+        last_ip="$public_ip"
+
+        if [ "$newnym_tries" -lt "$MAX_NEWNYM_TRIES" ]; then
+            echo -e "${CYAN}    > Requesting a new circuit (NEWNYM)...${NC}"
+            send_newnym "$control_port" "$ctrl_pass"
+            newnym_tries=$((newnym_tries+1))
+            sleep 6
+        else
+            echo -e "${YELLOW}    > Same/bad exit detected. Rebuilding Tor with this IP excluded...${NC}"
+            write_node_conf "$conf_file" "$out_port" "$control_port" "$hashed_pass" "$inst_data_dir" "$code"
+            pkill -f "node_${code}_${out_port}.conf" 2>/dev/null || true
+            sleep 2
+            sudo -u debian-tor tor -f "$conf_file" >/dev/null 2>&1 &
+            sleep 7
+            newnym_tries=0
         fi
     done
 
-    echo -e "${RED}[-] Setup failed or Country restricted for $code - $name (Could not connect to Tor)${NC}\n"
+    rm -f "$ip_file"
+    pkill -f "node_${code}_${out_port}.conf" 2>/dev/null || true
+    rm -f "$conf_file"
+    echo -e "${RED}[-] FAILED: No verified $code exit IP was available after $MAX_TOTAL_VALIDATION_ATTEMPTS attempts.${NC}"
+    echo -e "${YELLOW}[!] The node was NOT marked online and no wrong-country IP was accepted.${NC}\n"
+    return 1
 }
 
 # ================= CORE MENUS =================
@@ -383,7 +443,7 @@ install_engine() {
     echo -e "${YELLOW}[*] Updating package lists...${NC}"
     apt-get update -qq
     echo -e "${YELLOW}[*] Installing prerequisites (Tor, Curl, JQ, Nano, OpenSSL, Zip, Cron)...${NC}"
-    apt-get install -y tor tor-geoipdb curl jq nano openssl unzip zip cron
+    apt-get install -y tor tor-geoipdb curl jq nano openssl unzip zip cron ca-certificates
     systemctl stop tor 2>/dev/null || true
     systemctl disable tor 2>/dev/null || true
     mkdir -p "$BASE_DIR"
