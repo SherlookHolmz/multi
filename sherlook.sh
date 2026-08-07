@@ -27,6 +27,11 @@ MAX_NEWNYM_TRIES=2
 # Maximum total public-IP validation cycles for one node deployment
 MAX_TOTAL_VALIDATION_ATTEMPTS=30
 
+# Argentina: dynamically discover currently-running Tor exits from Onionoo.
+AR_ONIONOO_URL="https://onionoo.torproject.org/details?country=ar&flag=Exit&running=true&fields=fingerprint,or_addresses,country,flags,last_seen"
+AR_CANDIDATE_LIMIT=24
+AR_CANDIDATE_TIMEOUT=8
+
 # Format: "CountryCode : CountryName : TorPort"
 declare -A NODES=(
     [01]="DE:Germany:9080" [02]="TR:Turkey:9081" [03]="US:United States:9082"
@@ -158,6 +163,34 @@ send_newnym() {
     ) 2>/dev/null || true
 }
 
+# ================= AR EXIT DISCOVERY =================
+get_ar_exit_fingerprints() {
+    local json
+    json=$(curl -4 -fsS --connect-timeout "$AR_CANDIDATE_TIMEOUT" \
+        --max-time "$AR_CANDIDATE_TIMEOUT" "$AR_ONIONOO_URL" 2>/dev/null || true)
+    [ -n "$json" ] || return 1
+
+    echo "$json" | jq -r '
+        .relays[]?
+        | select(.country == "ar")
+        | select((.flags // []) | index("Exit"))
+        | select((.flags // []) | index("Running"))
+        | .fingerprint
+    ' 2>/dev/null | awk 'NF && !seen[$0]++' | head -n "$AR_CANDIDATE_LIMIT" | tr '\n' ' '
+}
+
+get_exit_selector() {
+    local code="$1"
+    if [ "$code" = "AR" ]; then
+        local fps
+        fps=$(get_ar_exit_fingerprints || true)
+        [ -n "$fps" ] || return 1
+        echo "$fps"
+        return 0
+    fi
+    echo "{$code}"
+}
+
 # Rebuilds a node's torrc from scratch, folding in any exit IPs that were
 # previously proven to be geo-mismatched (persisted in bad_exits.txt). This
 # is the actual fix for "every time I get the wrong country I have to wipe
@@ -177,13 +210,21 @@ write_node_conf() {
         fi
     fi
 
+    local exit_selector
+    exit_selector=$(get_exit_selector "$code" 2>/dev/null || true)
+
+    if [ "$code" = "AR" ] && [ -z "$exit_selector" ]; then
+        echo -e "${RED}[!] No currently-running Argentina Tor exits were discovered.${NC}" >&2
+        return 2
+    fi
+
     cat <<EOF > "$conf_file"
 SocksPort 0.0.0.0:$out_port
 ControlPort 127.0.0.1:$control_port
 HashedControlPassword $hashed_pass
 DataDirectory $inst_data_dir
 GeoIPExcludeUnknown 1
-ExitNodes {$code}
+ExitNodes $exit_selector
 StrictNodes 1
 $exclude_line
 RunAsDaemon 1
@@ -343,7 +384,11 @@ EOF
         chmod 600 "$ctrl_file"
     fi
 
-    write_node_conf "$conf_file" "$out_port" "$control_port" "$hashed_pass" "$inst_data_dir" "$code"
+    if ! write_node_conf "$conf_file" "$out_port" "$control_port" "$hashed_pass" "$inst_data_dir" "$code"; then
+        rm -f "$ip_file" "$conf_file"
+        echo -e "${RED}[-] FAILED: No usable $code Tor exit candidates are currently available.${NC}"
+        return 1
+    fi
     chown debian-tor:debian-tor "$conf_file" 2>/dev/null || true
 
     if pgrep -f "node_${code}_${out_port}.conf" > /dev/null; then
@@ -475,7 +520,10 @@ rotate_one_node() {
         touch "$bad_file"
         grep -qxF "$old_ip" "$bad_file" 2>/dev/null || echo "$old_ip" >> "$bad_file"
     }
-    write_node_conf "$conf_file" "$out_port" "$CTRL_PORT" "$HASHED_PASS" "$inst_data_dir" "$code"
+    if ! write_node_conf "$conf_file" "$out_port" "$CTRL_PORT" "$HASHED_PASS" "$inst_data_dir" "$code"; then
+        [ "$silent" = "1" ] || echo -e "${RED}  ✗ $code: no usable Tor exit candidates found.${NC}"
+        return 1
+    fi
     pkill -f "node_${code}_${out_port}.conf" 2>/dev/null || true
     sleep 1
     sudo -u debian-tor tor -f "$conf_file" >/dev/null 2>&1 &
@@ -496,7 +544,9 @@ rotate_one_node() {
                 grep -qxF "$new_ip" "$bad_file" 2>/dev/null || echo "$new_ip" >> "$bad_file"
                 sort -u -o "$bad_file" "$bad_file" 2>/dev/null || true
             fi
-            write_node_conf "$conf_file" "$out_port" "$CTRL_PORT" "$HASHED_PASS" "$inst_data_dir" "$code"
+            if ! write_node_conf "$conf_file" "$out_port" "$CTRL_PORT" "$HASHED_PASS" "$inst_data_dir" "$code"; then
+                break
+            fi
             pkill -f "node_${code}_${out_port}.conf" 2>/dev/null || true
             sleep 1
             sudo -u debian-tor tor -f "$conf_file" >/dev/null 2>&1 &
