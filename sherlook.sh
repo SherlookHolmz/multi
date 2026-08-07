@@ -76,11 +76,18 @@ declare -A EMOJIS=(
     [LK]="🇱🇰" [UY]="🇺🇾" [VE]="🇻🇪" [PA]="🇵🇦" [DO]="🇩🇴" [BO]="🇧🇴"
 )
 
-# Countries known to usually have very few Tor exit relays. We still allow
-# them (user choice), but we warn, because a 1-relay country pool is exactly
-# what causes "wrong country IP" loops that never truly resolve.
+# Tor Exit preflight.
+# A location is only considered installable when Onionoo currently reports at
+# least one running Tor relay with the Exit flag in that country.
+ONIONOO_URL="https://onionoo.torproject.org/details"
+ONIONOO_TIMEOUT=12
+ONIONOO_MIN_EXITS=1
+
+# Countries with historically small Tor exit pools. These are warnings only;
+# the actual availability check is always performed dynamically.
 declare -A LOW_SUPPLY_WARN=(
-    [IS]=1 [SC]=1 [AZ]=1 [MD]=1 [CY]=1 [TN]=1 [GE]=1 [KZ]=1 [QA]=1 [SA]=1 [AE]=1 [CR]=1
+    [IS]=1 [SC]=1 [AZ]=1 [MD]=1 [CY]=1 [TN]=1 [GE]=1 [KZ]=1
+    [QA]=1 [SA]=1 [AE]=1 [CR]=1 [AR]=1 [PK]=1 [BO]=1 [VE]=1
 )
 
 ORDER=({01..83})
@@ -98,6 +105,82 @@ check_root() {
 # Consults the SAME geolocation source for both the abuse check and the
 # country check, so we are always comparing apples to apples against what
 # Tor's own consensus GeoIP database claims for the exit relay's country.
+# ================= TOR EXIT PREFLIGHT =================
+
+onionoo_exit_count() {
+    local code="${1,,}"
+    local tmp count
+
+    tmp=$(mktemp /tmp/sherlook_onionoo.XXXXXX) || {
+        echo "-1"
+        return 0
+    }
+
+    if ! curl -4 -fsS \
+        --connect-timeout 5 \
+        --max-time "$ONIONOO_TIMEOUT" \
+        "${ONIONOO_URL}?country=${code}&flag=Exit&running=true&fields=fingerprint,or_addresses,country,flags,last_seen" \
+        -o "$tmp" 2>/dev/null; then
+        rm -f "$tmp"
+        echo "-1"
+        return 0
+    fi
+
+    count=$(jq -r '.relays // [] | length' "$tmp" 2>/dev/null || echo "0")
+    rm -f "$tmp"
+
+    [[ "$count" =~ ^[0-9]+$ ]] || count=0
+    echo "$count"
+}
+
+check_country_exit_availability() {
+    local code="$1"
+    local name="$2"
+    local count
+
+    echo -e "${CYAN}[*] Checking Tor Exit availability for ${WHITE}$code - $name${CYAN}...${NC}"
+
+    count=$(onionoo_exit_count "$code")
+
+    if [ "$count" = "-1" ]; then
+        echo -e "${YELLOW}[!] Onionoo availability check failed for $code.${NC}"
+        echo -e "${YELLOW}[!] Continuing with Tor because the directory service could not be reached.${NC}"
+        return 0
+    fi
+
+    if [ "$count" -lt "$ONIONOO_MIN_EXITS" ]; then
+        echo -e "${RED}[-] No running Tor Exit relay was found for $code - $name.${NC}"
+        echo -e "${YELLOW}[!] Location was NOT installed and no Tor instance will be started.${NC}"
+        return 1
+    fi
+
+    echo -e "${GREEN}[+] $code - $name: $count running Tor Exit relay(s) reported by Onionoo.${NC}"
+    return 0
+}
+
+cleanup_failed_node() {
+    local code="$1"
+    local out_port="$2"
+    local conf_file="$BASE_DIR/node_${code}_${out_port}.conf"
+    local inst_data_dir="$DATA_DIR/${code}_${out_port}"
+
+    pkill -f "node_${code}_${out_port}.conf" 2>/dev/null || true
+    sleep 1
+    rm -f "$conf_file"
+    rm -rf "$inst_data_dir"
+}
+
+node_is_installed() {
+    local code="$1"
+    local out_port="$2"
+    local conf_file="$BASE_DIR/node_${code}_${out_port}.conf"
+    local ip_file="$DATA_DIR/${code}_${out_port}/last_ip.txt"
+
+    [ -f "$conf_file" ] &&
+    [ -s "$ip_file" ] &&
+    grep -Eq '^[0-9]+(\.[0-9]+){3}$' "$ip_file"
+}
+
 check_ip_quality() {
     local ip="$1"
     local expected_cc="${2^^}"
@@ -178,7 +261,7 @@ write_node_conf() {
     fi
 
     cat <<EOF > "$conf_file"
-SocksPort 0.0.0.0:$out_port
+SocksPort 127.0.0.1:$out_port
 ControlPort 127.0.0.1:$control_port
 HashedControlPassword $hashed_pass
 DataDirectory $inst_data_dir
@@ -316,6 +399,13 @@ deploy_node() {
     local ctrl_file="$inst_data_dir/control.env"
     local bad_file="$inst_data_dir/bad_exits.txt"
 
+    # Do not even create a Tor node when the selected country has no
+    # currently-running Tor Exit relay.
+    if ! check_country_exit_availability "$code" "$name"; then
+        cleanup_failed_node "$code" "$out_port"
+        return 2
+    fi
+
     mkdir -p "$BASE_DIR" "$inst_data_dir"
     touch "$bad_file"
     chown -R debian-tor:debian-tor "$inst_data_dir" 2>/dev/null || true
@@ -417,9 +507,7 @@ EOF
         fi
     done
 
-    rm -f "$ip_file"
-    pkill -f "node_${code}_${out_port}.conf" 2>/dev/null || true
-    rm -f "$conf_file"
+    cleanup_failed_node "$code" "$out_port"
     echo -e "${RED}[-] FAILED: No verified $code exit IP was available after $MAX_TOTAL_VALIDATION_ATTEMPTS attempts.${NC}"
     echo -e "${YELLOW}[!] The node was NOT marked online and no wrong-country IP was accepted.${NC}\n"
     return 1
@@ -622,7 +710,7 @@ list_locations() {
 
         IFS=':' read -r code1 name1 port1 <<< "${NODES[$idx1]}"
         local stat1="$CIRCLE_OFF"
-        if [ -f "$BASE_DIR/node_${code1}_${port1}.conf" ]; then
+        if node_is_installed "$code1" "$port1"; then
             stat1="$CIRCLE_ON"
         fi
 
@@ -630,7 +718,7 @@ list_locations() {
         if [[ -n "${NODES[$idx2]:-}" ]]; then
             IFS=':' read -r code2 name2 port2 <<< "${NODES[$idx2]}"
             local stat2="$CIRCLE_OFF"
-            if [ -f "$BASE_DIR/node_${code2}_${port2}.conf" ]; then
+            if node_is_installed "$code2" "$port2"; then
                 stat2="$CIRCLE_ON"
             fi
             col2_str=$(printf "${C_CYAN}[%s]${NC} %b %-16s" "$idx2" "$stat2" "$name2")
@@ -653,7 +741,7 @@ add_single_node() {
     if [[ -n "${NODES[$p_idx]:-}" ]]; then
         IFS=':' read -r code name out_port <<< "${NODES[$p_idx]}"
 
-        if [ -f "$BASE_DIR/node_${code}_${out_port}.conf" ]; then
+        if node_is_installed "$code" "$out_port"; then
             echo -e "\n${YELLOW}[!] Node $code - $name is already active. You cannot install it again.${NC}"
             sleep 2
         else
@@ -679,7 +767,7 @@ bulk_add_nodes() {
         for idx in "${ORDER[@]}"; do
             IFS=':' read -r code name out_port <<< "${NODES[$idx]}"
 
-            if [ -f "$BASE_DIR/node_${code}_${out_port}.conf" ]; then
+            if node_is_installed "$code" "$out_port"; then
                 continue
             fi
 
@@ -705,7 +793,7 @@ bulk_add_nodes() {
                 if [[ -n "${NODES[$p_idx]:-}" ]]; then
                     IFS=':' read -r code name out_port <<< "${NODES[$p_idx]}"
 
-                    if [ -f "$BASE_DIR/node_${code}_${out_port}.conf" ]; then
+                    if node_is_installed "$code" "$out_port"; then
                         echo -e "${YELLOW}[!] $code - $name is already active. Skipping...${NC}"
                     else
                         echo -e "\n${CYAN}[*] Processing ${WHITE}$code - $name${CYAN}...${NC}"
@@ -724,7 +812,7 @@ bulk_add_nodes() {
         for p_idx in "${main_list[@]}"; do
             IFS=':' read -r code name out_port <<< "${NODES[$p_idx]}"
 
-            if [ -f "$BASE_DIR/node_${code}_${out_port}.conf" ]; then
+            if node_is_installed "$code" "$out_port"; then
                 echo -e "${YELLOW}[!] $code - $name is already active. Skipping...${NC}"
                 continue
             fi
@@ -755,6 +843,11 @@ view_active_nodes() {
 
             local conf_file="$BASE_DIR/node_${code}_${out_port}.conf"
             local ip_file="$DATA_DIR/${code}_${out_port}/last_ip.txt"
+
+            if [ -f "$conf_file" ] && ! node_is_installed "$code" "$out_port"; then
+                # A stale/incomplete deployment must never count as installed.
+                rm -f "$ip_file"
+            fi
 
             if [ -f "$conf_file" ]; then
                 found=1
@@ -941,7 +1034,7 @@ panel_batch_create() {
     local installed=()
     for idx in "${ORDER[@]}"; do
         IFS=':' read -r code name out_port <<< "${NODES[$idx]}"
-        if [ -f "$BASE_DIR/node_${code}_${out_port}.conf" ]; then
+        if node_is_installed "$code" "$out_port"; then
             installed+=("$idx")
         fi
     done
