@@ -1,72 +1,34 @@
-#!/usr/bin/env bash
-set -euo pipefail
+#!/bin/bash
+set -e
 
 REPO="https://raw.githubusercontent.com/SherlookHolmz/multi/main"
 INSTALL_DIR="/root/.sherlook"
-TARGET="$INSTALL_DIR/sherlook.sh"
-BIN="/usr/local/bin/sherlook"
 
-GREEN='\033[1;32m'
-YELLOW='\033[1;33m'
-RED='\033[1;31m'
-CYAN='\033[1;36m'
-NC='\033[0m'
-
-if [ "${EUID:-$(id -u)}" -ne 0 ]; then
-    echo -e "${RED}[!] Run this installer as root.${NC}"
-    exit 1
-fi
+echo "[+] Installing Sherlook Multi..."
 
 mkdir -p "$INSTALL_DIR"
 
-TMP="$(mktemp "$INSTALL_DIR/.sherlook.sh.XXXXXX")"
-trap 'rm -f "$TMP"' EXIT
+echo "[+] Downloading latest sherlook.sh..."
 
-URL="$REPO/sherlook.sh"
+curl -fL --retry 3 --connect-timeout 15 \
+    -o "$INSTALL_DIR/sherlook.sh" \
+    "$REPO/sherlook.sh"
 
-echo -e "${CYAN}[+] Downloading latest Sherlook Multi...${NC}"
+chmod +x "$INSTALL_DIR/sherlook.sh"
 
-download_ok=0
+echo "[+] Creating sherlook command..."
 
-if command -v curl >/dev/null 2>&1; then
-    if curl -4 -fL --retry 3 --retry-delay 1 \
-        --connect-timeout 10 --max-time 120 \
-        -o "$TMP" "$URL"; then
-        download_ok=1
-    fi
-elif command -v wget >/dev/null 2>&1; then
-    if wget -4 -q --tries=3 --timeout=20 \
-        -O "$TMP" "$URL"; then
-        download_ok=1
-    fi
-else
-    echo -e "${RED}[!] curl or wget is required.${NC}"
-    exit 1
-fi
+cat > /usr/local/bin/sherlook <<EOF
+#!/bin/bash
+exec "$INSTALL_DIR/sherlook.sh" "\$@"
+EOF
 
-if [ "$download_ok" -ne 1 ] || [ ! -s "$TMP" ]; then
-    echo -e "${RED}[!] Failed to download sherlook.sh${NC}"
-    exit 1
-fi
-
-if ! head -n 1 "$TMP" | grep -q '^#!/usr/bin/env bash'; then
-    echo -e "${RED}[!] Downloaded file is not a valid Sherlook shell script.${NC}"
-    exit 1
-fi
-
-if ! bash -n "$TMP"; then
-    echo -e "${RED}[!] Downloaded sherlook.sh contains a shell syntax error.${NC}"
-    exit 1
-fi
-
-install -m 700 "$TMP" "$TARGET"
-install -m 755 "$TMP" "$BIN"
-
-rm -f "$TMP"
-trap - EXIT
+chmod +x /usr/local/bin/sherlook
 
 echo
-echo -e "${GREEN}[+] Sherlook Multi updated successfully.${NC}"
-echo -e "${GREEN}[+] Command: sherlook${NC}"
-echo -e "${YELLOW}[!] Existing Tor node data/configurations were preserved.${NC}"
+echo "[+] Sherlook installed successfully."
+echo
+echo "Run:"
+echo
+echo "    sherlook"
 echo
