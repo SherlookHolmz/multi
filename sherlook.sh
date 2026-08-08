@@ -307,7 +307,7 @@ background_auto_heal() {
 
         if [ $is_dead -eq 0 ]; then
             local test_ip
-            test_ip=$(curl -s --socks5-hostname 127.0.0.1:"$out_port" https://api.ipify.org --connect-timeout 5 --max-time 10 || true)
+            test_ip=$(curl -s --socks5-hostname 127.0.0.1:"$out_port" https://api.ipify.org --connect-timeout 5 --max-time 20 || true)
             if [[ ! "$test_ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
                 is_dead=1
             else
@@ -337,7 +337,7 @@ background_auto_heal() {
             (
                 sleep 15
                 local new_ip
-                new_ip=$(curl -s --socks5-hostname 127.0.0.1:"$out_port" https://api.ipify.org --max-time 15 || true)
+                new_ip=$(curl -s --socks5-hostname 127.0.0.1:"$out_port" https://api.ipify.org --connect-timeout 5 --max-time 20 || true)
                 if [[ "$new_ip" =~ ^[0-9]+(\.[0-9]+){3}$ ]]; then
                     local heal_result heal_bad
                     heal_result=$(check_ip_quality "$new_ip" "$code")
@@ -780,29 +780,79 @@ bulk_add_nodes() {
 
     elif [ "$bulk_opt" == "2" ]; then
         list_locations
-        echo -e "${YELLOW}Example format: 1, 4, 15, 22${NC}"
-        read -p "$(echo -e ${CYAN}"Enter indices separated by comma: "${NC})" custom_list
+        echo -e "${YELLOW}Example: 1,4,15 or range: 1-4 or mixed: 1,4-7,15${NC}"
+        read -r -p "$(echo -e ${CYAN}"Enter indices (e.g. 1,2,4-7): "${NC})" custom_list
 
-        if [ -z "$custom_list" ] || [ "$custom_list" == "00" ] || [ "$custom_list" == "0" ]; then return; fi
+        if [ -z "$custom_list" ] || [ "$custom_list" == "00" ] || [ "$custom_list" == "0" ]; then
+            return
+        fi
+
+        custom_list="${custom_list// /}"
+        custom_list="${custom_list//;/,}"
+
+        declare -a selected=()
+        declare -A seen=()
 
         IFS=',' read -ra ADDR <<< "$custom_list"
-        for i in "${ADDR[@]}"; do
-            local clean_i=$(echo "$i" | sed 's/^0*//' | tr -d ' ')
-            if [ -n "$clean_i" ]; then
-                local p_idx=$(printf "%02d" "$clean_i")
-                if [[ -n "${NODES[$p_idx]:-}" ]]; then
-                    IFS=':' read -r code name out_port <<< "${NODES[$p_idx]}"
 
-                    if node_is_installed "$code" "$out_port"; then
-                        echo -e "${YELLOW}[!] $code - $name is already active. Skipping...${NC}"
-                    else
-                        echo -e "\n${CYAN}[*] Processing ${WHITE}$code - $name${CYAN}...${NC}"
-                        deploy_node "$code" "$name" "$out_port"
-                        sleep 1
-                    fi
+        for part in "${ADDR[@]}"; do
+            [[ -z "$part" ]] && continue
+
+            if [[ "$part" =~ ^([0-9]+)-([0-9]+)$ ]]; then
+                first="${BASH_REMATCH[1]}"
+                last="${BASH_REMATCH[2]}"
+
+                if (( first > last )); then
+                    tmp="$first"
+                    first="$last"
+                    last="$tmp"
                 fi
+
+                for ((n=first; n<=last; n++)); do
+                    p_idx=$(printf "%02d" "$n")
+
+                    if [[ -n "${NODES[$p_idx]:-}" && -z "${seen[$p_idx]:-}" ]]; then
+                        selected+=("$p_idx")
+                        seen[$p_idx]=1
+                    fi
+                done
+
+            elif [[ "$part" =~ ^[0-9]+$ ]]; then
+                p_idx=$(printf "%02d" "$part")
+
+                if [[ -n "${NODES[$p_idx]:-}" && -z "${seen[$p_idx]:-}" ]]; then
+                    selected+=("$p_idx")
+                    seen[$p_idx]=1
+                fi
+
+            else
+                echo -e "${YELLOW}[!] Invalid selection: $part${NC}"
             fi
         done
+
+        if [ "${#selected[@]}" -eq 0 ]; then
+            echo -e "${RED}[!] No valid locations selected.${NC}"
+            sleep 2
+            return
+        fi
+
+        echo -e "${CYAN}[*] Selected ${#selected[@]} location(s).${NC}"
+        echo -e "${YELLOW}[*] Discovery timeout: 20 seconds per location.${NC}"
+        echo
+
+        for p_idx in "${selected[@]}"; do
+            IFS=':' read -r code name out_port <<< "${NODES[$p_idx]}"
+
+            if node_is_installed "$code" "$out_port"; then
+                echo -e "${YELLOW}[!] $code - $name is already active. Skipping...${NC}"
+                continue
+            fi
+
+            echo -e "\n${CYAN}[*] Processing ${WHITE}$code - $name${CYAN}...${NC}"
+            deploy_node "$code" "$name" "$out_port"
+            sleep 1
+        done
+
         echo -e "\n${GREEN}[+] Custom batch deployment sequence complete!${NC}"
         read -r -p "$(echo -e ${WHITE}"Press Enter to return to main menu..."${NC})" < /dev/tty
 
@@ -868,7 +918,7 @@ view_active_nodes() {
                     (
                         while true; do
                             sleep 8
-                            local new_ip=$(curl -s --socks5-hostname 127.0.0.1:$out_port https://api.ipify.org --max-time 15 || true)
+                            local new_ip=$(curl -s --socks5-hostname 127.0.0.1:$out_port https://api.ipify.org --connect-timeout 5 --max-time 20 || true)
                             if [[ "$new_ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
                                 echo "$new_ip" > "$ip_file"
                                 break
