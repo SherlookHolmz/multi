@@ -4,65 +4,69 @@ set -euo pipefail
 REPO_BASE="https://raw.githubusercontent.com/SherlookHolmz/multi/main"
 ENGINE_URL="$REPO_BASE/sherlook.sh"
 INSTALLER_URL="$REPO_BASE/install.sh"
+
 INSTALL_DIR="/root/.sherlook"
 INSTALL_PATH="/usr/local/bin/sherlook"
+BASE_DIR="/etc/tor/sherlook_nodes"
+DATA_DIR="/var/lib/tor/sherlook_nodes"
+EXPECTED_VERSION="6.1.0"
 
 say(){ printf '%s\n' "$*"; }
 fail(){ say "[!] $*"; exit 1; }
 
-[ "${EUID:-$(id -u)}" -eq 0 ] || fail "Please run as root (sudo)."
-command -v curl >/dev/null 2>&1 || { apt-get update -qq; apt-get install -y curl ca-certificates; }
+[ "${EUID:-$(id -u)}" -eq 0 ] || fail "Please run as root."
 
-say "[+] Installing Sherlook..."
-mkdir -p "$INSTALL_DIR"
-
-tmp_engine=$(mktemp /tmp/sherlook_engine.XXXXXX)
-tmp_installer=$(mktemp /tmp/sherlook_installer.XXXXXX)
-trap 'rm -f "$tmp_engine" "$tmp_installer"' EXIT
-
-say "[+] Downloading latest sherlook.sh..."
-curl -4 -fL --retry 5 --retry-delay 1 --connect-timeout 10 --max-time 90 -o "$tmp_engine" "$ENGINE_URL" \
-  || fail "Engine download failed."
-
-say "[+] Validating downloaded engine..."
-head -n1 "$tmp_engine" | grep -q '^#!' || fail "Downloaded engine is not a script."
-bash -n "$tmp_engine" || fail "Downloaded engine failed bash syntax validation."
-grep -q 'SHERLOOK_VERSION=' "$tmp_engine" || fail "Downloaded engine is missing version metadata."
-
-say "[+] Downloading latest install.sh..."
-if curl -4 -fL --retry 3 --connect-timeout 10 --max-time 60 -o "$tmp_installer" "$INSTALLER_URL"; then
-  head -n1 "$tmp_installer" | grep -q '^#!' || fail "Downloaded installer is invalid."
-  bash -n "$tmp_installer" || fail "Downloaded installer failed syntax validation."
-else
-  say "[!] Could not fetch remote install.sh; continuing with the validated engine."
-fi
-
-say "[+] Installing prerequisites..."
 apt-get update -qq
 DEBIAN_FRONTEND=noninteractive apt-get install -y \
-  tor tor-geoipdb curl jq nano openssl unzip zip cron ca-certificates util-linux
+    tor tor-geoipdb curl jq ca-certificates util-linux cron
 
-install -d -m 755 "$INSTALL_DIR"
-install -m 755 "$tmp_engine" "$INSTALL_DIR/sherlook.sh"
-install -m 755 "$tmp_engine" "$INSTALL_PATH"
-if [ -s "$tmp_installer" ]; then
-  install -m 755 "$tmp_installer" "$INSTALL_DIR/install.sh"
-  install -m 755 "$tmp_installer" /usr/local/bin/sherlook-install
+mkdir -p "$INSTALL_DIR" "$BASE_DIR" "$DATA_DIR"
+
+# Preserve existing node/state data before installing anything.
+backup="$(mktemp -d /tmp/sherlook-state.XXXXXX)"
+trap 'rm -rf "$backup" "$engine" "$installer"' EXIT
+cp -a "$BASE_DIR/." "$backup/base/" 2>/dev/null || true
+cp -a "$DATA_DIR/." "$backup/data/" 2>/dev/null || true
+
+engine="$(mktemp /tmp/sherlook-engine.XXXXXX)"
+installer="$(mktemp /tmp/sherlook-installer.XXXXXX)"
+
+curl -4 -fL --retry 5 --retry-delay 1 \
+    --connect-timeout 10 --max-time 90 \
+    -o "$engine" "$ENGINE_URL" || fail "Engine download failed."
+
+bash -n "$engine" || fail "Engine syntax validation failed."
+grep -q "^SHERLOOK_VERSION=\"$EXPECTED_VERSION\"$" "$engine" \
+    || fail "Remote engine is not v$EXPECTED_VERSION."
+
+# Never install a stale v6.0 engine.
+if grep -qE 'v6\.0|6\.0\.0|V 6 \. 0' "$engine"; then
+    fail "Downloaded engine still contains v6.0 markers."
+fi
+
+if curl -4 -fL --retry 3 --connect-timeout 10 --max-time 60 \
+    -o "$installer" "$INSTALLER_URL"; then
+    bash -n "$installer" || fail "Installer syntax validation failed."
 else
-  install -m 755 "$0" "$INSTALL_DIR/install.sh" 2>/dev/null || true
-  install -m 755 "$0" /usr/local/bin/sherlook-install 2>/dev/null || true
+    rm -f "$installer"
 fi
 
-# Validate the installed engine and report its version without launching the interactive UI.
-engine_version=$(grep -m1 '^SHERLOOK_VERSION=' "$INSTALL_PATH" | sed -E 's/^SHERLOOK_VERSION="([^"]+)"/\1/' || true)
-say "[+] Engine version: ${engine_version:-unknown}"
-if ! grep -q 'sherlook-heal.service' "$INSTALL_PATH"; then
-  fail "Installed engine does not contain the health service setup."
+install -m 755 "$engine" "$INSTALL_DIR/sherlook.sh"
+install -m 755 "$engine" "$INSTALL_PATH"
+
+if [ -s "$installer" ]; then
+    install -m 755 "$installer" "$INSTALL_DIR/install.sh"
+    install -m 755 "$installer" /usr/local/bin/sherlook-install
 fi
 
-say "[+] Running initial engine setup..."
-mkdir -p /etc/tor/sherlook_nodes /var/lib/tor/sherlook_nodes /root/.sherlook
-chown -R debian-tor:debian-tor /var/lib/tor/sherlook_nodes 2>/dev/null || true
+# Restore state only if the target directories became empty.
+if [ -d "$backup/base" ] && [ -z "$(find "$BASE_DIR" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null)" ]; then
+    cp -a "$backup/base/." "$BASE_DIR/" 2>/dev/null || true
+fi
+if [ -d "$backup/data" ] && [ -z "$(find "$DATA_DIR" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null)" ]; then
+    cp -a "$backup/data/." "$DATA_DIR/" 2>/dev/null || true
+fi
+chown -R debian-tor:debian-tor "$DATA_DIR" 2>/dev/null || true
 
 cat > /etc/systemd/system/sherlook-heal.service <<EOF
 [Unit]
@@ -81,13 +85,16 @@ MemoryMax=256M
 [Install]
 WantedBy=multi-user.target
 EOF
+
 systemctl daemon-reload
 systemctl enable --now sherlook-heal.service
 
-echo "*/15 * * * * root systemctl is-active --quiet sherlook-heal.service || systemctl restart sherlook-heal.service" > /etc/cron.d/sherlook_watchdog
+cat > /etc/cron.d/sherlook_watchdog <<EOF
+*/5 * * * * root systemctl is-active --quiet sherlook-heal.service || systemctl restart sherlook-heal.service
+EOF
 chmod 644 /etc/cron.d/sherlook_watchdog
 systemctl restart cron 2>/dev/null || true
 
-say "[+] Sherlook installed successfully."
-say "[+] Run: sherlook"
-say "[+] Auto-Heal service: $(systemctl is-active sherlook-heal.service 2>/dev/null || true)"
+say "[+] Sherlook v$EXPECTED_VERSION installed."
+say "[+] Engine: $(grep -m1 '^SHERLOOK_VERSION=' "$INSTALL_PATH")"
+say "[+] Auto-Heal: $(systemctl is-active sherlook-heal.service 2>/dev/null || true)"
