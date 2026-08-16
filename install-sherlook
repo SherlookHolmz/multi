@@ -1,81 +1,32 @@
-#!/bin/bash
+#!/usr/bin/env bash
+# Sherlook Automate Engine (Nexatis Edition) - Auto Installer
 
-# ==========================================
-# Sherlook Installer Script - Version 6.1.1
-# Repository: SherlookHolmz/sherlook
-# ==========================================
+RED='\033[1;31m'
+GREEN='\033[1;32m'
+CYAN='\033[1;36m'
+NC='\033[0m'
 
-set -e
-
-EXPECTED_VERSION="6.1.1"
-REPO_URL="https://raw.githubusercontent.com/SherlookHolmz/sherlook/main/sherlook.sh"
-INSTALL_DIR="/usr/local/bin"
-TARGET_BIN="${INSTALL_DIR}/sherlook"
-
-# Color Codes
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-BLUE='\033[0;34m'
-NC='\033[0m' # No Color
-
-echo -e "${BLUE}==========================================${NC}"
-echo -e "${BLUE}       Sherlook Installer v${EXPECTED_VERSION}        ${NC}"
-echo -e "${BLUE}==========================================${NC}"
-
-# 1. Check Root Privileges
 if [ "$EUID" -ne 0 ]; then
-    echo -e "${RED}[ERROR] لطفاً اسکریپت را با دسترسی root (یا sudo) اجرا کنید.${NC}"
+    echo -e "${RED}[!] Error: Please run as root (sudo).${NC}"
     exit 1
 fi
 
-# 2. Check and Install Dependencies
-echo -e "${YELLOW}[*] در حال بررسی و نصب پیش‌نیازها...${NC}"
-DEPENDENCIES=("curl" "jq" "tor")
+echo -e "${CYAN}[*] Fetching the latest Sherlook Engine...${NC}"
+RAW_URL="https://raw.githubusercontent.com/SherlookHolmz/multi/main/sherlook.sh"
 
-for dep in "${DEPENDENCIES[@]}"; do
-    if ! command -v "$dep" &> /dev/null; then
-        echo -e "${YELLOW}[!] ابزار $dep یافت نشد. در حال نصب...${NC}"
-        if command -v apt-get &> /dev/null; then
-            apt-get update -qq && apt-get install -y -qq "$dep"
-        elif command -v yum &> /dev/null; then
-            yum install -y -q "$dep"
-        elif command -v dnf &> /dev/null; then
-            dnf install -y -q "$dep"
-        else
-            echo -e "${RED}[ERROR] مدیریت پکیج مناسب یافت نشد. لطفاً $dep را دستی نصب کنید.${NC}"
-            exit 1
-        fi
-    fi
-done
+# Download the script to a temporary location
+curl -4 -fL --connect-timeout 10 --max-time 30 -o /tmp/sherlook.sh "$RAW_URL"
 
-# 3. Download Main Script
-echo -e "${YELLOW}[*] در حال دریافت فایل sherlook.sh (نسخه ${EXPECTED_VERSION})...${NC}"
-TMP_FILE=$(mktemp /tmp/sherlook_download.XXXXXX)
-
-if curl -fsSL "$REPO_URL" -o "$TMP_FILE"; then
-    echo -e "${GREEN}[+] اسکریپت اصلی با موفقیت دانلود شد.${NC}"
-else
-    echo -e "${RED}[ERROR] خطا در دانلود اسکریپت از گیت‌هاب. لطفاً اتصال اینترنت را بررسی کنید.${NC}"
-    rm -f "$TMP_FILE"
+if [ $? -ne 0 ]; then
+    echo -e "${RED}[!] Failed to download the engine from GitHub.${NC}"
     exit 1
 fi
 
-# 4. Verify Version
-DOWNLOADED_VERSION=$(grep -E '^SHERLOOK_VERSION=' "$TMP_FILE" | head -n 1 | cut -d'"' -f2 || echo "unknown")
+chmod +x /tmp/sherlook.sh
+echo -e "${GREEN}[+] Download successful. Starting automated installation...${NC}"
 
-if [ "$DOWNLOADED_VERSION" != "$EXPECTED_VERSION" ]; then
-    echo -e "${YELLOW}[!] هشدار: نسخه فایل دانلود شده ($DOWNLOADED_VERSION) با نسخه مورد انتظار ($EXPECTED_VERSION) متفاوت است.${NC}"
-else
-    echo -e "${GREEN}[+] تایید نسخه: ${DOWNLOADED_VERSION}${NC}"
-fi
+# Execute the engine with the silent install flag
+/tmp/sherlook.sh --install
 
-# 5. Install Binary and Set Executable Permissions
-mv -f "$TMP_FILE" "$TARGET_BIN"
-chmod +x "$TARGET_BIN"
-
-echo -e "${GREEN}[+] نصب و پیکربندی با موفقیت انجام شد!${NC}"
-echo -e "${BLUE}==========================================${NC}"
-echo -e "برای اجرای اسکریپت می‌توانید دستور زیر را وارد کنید:"
-echo -e "${YELLOW}sherlook${NC}"
-echo -e "${BLUE}==========================================${NC}"
+# Clean up
+rm -f /tmp/sherlook.sh
