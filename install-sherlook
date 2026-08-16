@@ -1,54 +1,93 @@
-#!/bin/bash
-set -e
+#!/usr/bin/env bash
+set -euo pipefail
 
-REPO="https://raw.githubusercontent.com/SherlookHolmz/multi/main"
+REPO_BASE="https://raw.githubusercontent.com/SherlookHolmz/multi/main"
+ENGINE_URL="$REPO_BASE/sherlook.sh"
+INSTALLER_URL="$REPO_BASE/install.sh"
 INSTALL_DIR="/root/.sherlook"
+INSTALL_PATH="/usr/local/bin/sherlook"
 
-if [ "$EUID" -ne 0 ]; then
-    echo "[!] Please run as root (sudo)."
-    exit 1
-fi
+say(){ printf '%s\n' "$*"; }
+fail(){ say "[!] $*"; exit 1; }
 
-echo "[+] Installing Sherlook Multi..."
+[ "${EUID:-$(id -u)}" -eq 0 ] || fail "Please run as root (sudo)."
+command -v curl >/dev/null 2>&1 || { apt-get update -qq; apt-get install -y curl ca-certificates; }
+
+say "[+] Installing Sherlook..."
 mkdir -p "$INSTALL_DIR"
 
-echo "[+] Downloading latest sherlook.sh..."
-if ! curl -fL --retry 3 --connect-timeout 15 \
-    -o "$INSTALL_DIR/sherlook.sh" \
-    "$REPO/sherlook.sh"; then
-    echo "[!] Download failed. Check your network/DNS and try again."
-    exit 1
+tmp_engine=$(mktemp /tmp/sherlook_engine.XXXXXX)
+tmp_installer=$(mktemp /tmp/sherlook_installer.XXXXXX)
+trap 'rm -f "$tmp_engine" "$tmp_installer"' EXIT
+
+say "[+] Downloading latest sherlook.sh..."
+curl -4 -fL --retry 5 --retry-delay 1 --connect-timeout 10 --max-time 90 -o "$tmp_engine" "$ENGINE_URL" \
+  || fail "Engine download failed."
+
+say "[+] Validating downloaded engine..."
+head -n1 "$tmp_engine" | grep -q '^#!' || fail "Downloaded engine is not a script."
+bash -n "$tmp_engine" || fail "Downloaded engine failed bash syntax validation."
+grep -q 'SHERLOOK_VERSION=' "$tmp_engine" || fail "Downloaded engine is missing version metadata."
+
+say "[+] Downloading latest install.sh..."
+if curl -4 -fL --retry 3 --connect-timeout 10 --max-time 60 -o "$tmp_installer" "$INSTALLER_URL"; then
+  head -n1 "$tmp_installer" | grep -q '^#!' || fail "Downloaded installer is invalid."
+  bash -n "$tmp_installer" || fail "Downloaded installer failed syntax validation."
+else
+  say "[!] Could not fetch remote install.sh; continuing with the validated engine."
 fi
 
-# curl -f only fails on HTTP error codes; a redirected/broken raw URL can
-# still land here with an empty or HTML (e.g. GitHub 404 page) body, which
-# would silently install a broken/non-functional "engine". Reject that.
-if [ ! -s "$INSTALL_DIR/sherlook.sh" ]; then
-    echo "[!] Downloaded file is empty. Aborting install."
-    rm -f "$INSTALL_DIR/sherlook.sh"
-    exit 1
+say "[+] Installing prerequisites..."
+apt-get update -qq
+DEBIAN_FRONTEND=noninteractive apt-get install -y \
+  tor tor-geoipdb curl jq nano openssl unzip zip cron ca-certificates util-linux
+
+install -d -m 755 "$INSTALL_DIR"
+install -m 755 "$tmp_engine" "$INSTALL_DIR/sherlook.sh"
+install -m 755 "$tmp_engine" "$INSTALL_PATH"
+if [ -s "$tmp_installer" ]; then
+  install -m 755 "$tmp_installer" "$INSTALL_DIR/install.sh"
+  install -m 755 "$tmp_installer" /usr/local/bin/sherlook-install
+else
+  install -m 755 "$0" "$INSTALL_DIR/install.sh" 2>/dev/null || true
+  install -m 755 "$0" /usr/local/bin/sherlook-install 2>/dev/null || true
 fi
 
-if ! head -n1 "$INSTALL_DIR/sherlook.sh" | grep -q '^#!'; then
-    echo "[!] Downloaded file does not look like a script (got HTML/error page instead)."
-    echo "[!] Check that $REPO/sherlook.sh is reachable and correct."
-    rm -f "$INSTALL_DIR/sherlook.sh"
-    exit 1
+# Validate the installed engine and report its version without launching the interactive UI.
+engine_version=$(grep -m1 '^SHERLOOK_VERSION=' "$INSTALL_PATH" | sed -E 's/^SHERLOOK_VERSION="([^"]+)"/\1/' || true)
+say "[+] Engine version: ${engine_version:-unknown}"
+if ! grep -q 'sherlook-heal.service' "$INSTALL_PATH"; then
+  fail "Installed engine does not contain the health service setup."
 fi
 
-chmod +x "$INSTALL_DIR/sherlook.sh"
+say "[+] Running initial engine setup..."
+mkdir -p /etc/tor/sherlook_nodes /var/lib/tor/sherlook_nodes /root/.sherlook
+chown -R debian-tor:debian-tor /var/lib/tor/sherlook_nodes 2>/dev/null || true
 
-echo "[+] Creating sherlook command..."
-cat > /usr/local/bin/sherlook <<EOF
-#!/bin/bash
-exec "$INSTALL_DIR/sherlook.sh" "\$@"
+cat > /etc/systemd/system/sherlook-heal.service <<EOF
+[Unit]
+Description=Sherlook Continuous Tor Node Health and IP Auto-Heal
+After=network-online.target tor.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=$INSTALL_PATH --auto-heal-daemon
+Restart=always
+RestartSec=2
+User=root
+MemoryMax=256M
+
+[Install]
+WantedBy=multi-user.target
 EOF
-chmod +x /usr/local/bin/sherlook
+systemctl daemon-reload
+systemctl enable --now sherlook-heal.service
 
-echo
-echo "[+] Sherlook installed successfully."
-echo
-echo "Run:"
-echo
-echo "    sherlook"
-echo
+echo "*/15 * * * * root systemctl is-active --quiet sherlook-heal.service || systemctl restart sherlook-heal.service" > /etc/cron.d/sherlook_watchdog
+chmod 644 /etc/cron.d/sherlook_watchdog
+systemctl restart cron 2>/dev/null || true
+
+say "[+] Sherlook installed successfully."
+say "[+] Run: sherlook"
+say "[+] Auto-Heal service: $(systemctl is-active sherlook-heal.service 2>/dev/null || true)"
