@@ -4,25 +4,45 @@ set -e
 REPO="https://raw.githubusercontent.com/SherlookHolmz/multi/main"
 INSTALL_DIR="/root/.sherlook"
 
-echo "[+] Installing Sherlook Multi..."
+if [ "$EUID" -ne 0 ]; then
+    echo "[!] Please run as root (sudo)."
+    exit 1
+fi
 
+echo "[+] Installing Sherlook Multi..."
 mkdir -p "$INSTALL_DIR"
 
 echo "[+] Downloading latest sherlook.sh..."
-
-curl -fL --retry 3 --connect-timeout 15 \
+if ! curl -fL --retry 3 --connect-timeout 15 \
     -o "$INSTALL_DIR/sherlook.sh" \
-    "$REPO/sherlook.sh"
+    "$REPO/sherlook.sh"; then
+    echo "[!] Download failed. Check your network/DNS and try again."
+    exit 1
+fi
+
+# curl -f only fails on HTTP error codes; a redirected/broken raw URL can
+# still land here with an empty or HTML (e.g. GitHub 404 page) body, which
+# would silently install a broken/non-functional "engine". Reject that.
+if [ ! -s "$INSTALL_DIR/sherlook.sh" ]; then
+    echo "[!] Downloaded file is empty. Aborting install."
+    rm -f "$INSTALL_DIR/sherlook.sh"
+    exit 1
+fi
+
+if ! head -n1 "$INSTALL_DIR/sherlook.sh" | grep -q '^#!'; then
+    echo "[!] Downloaded file does not look like a script (got HTML/error page instead)."
+    echo "[!] Check that $REPO/sherlook.sh is reachable and correct."
+    rm -f "$INSTALL_DIR/sherlook.sh"
+    exit 1
+fi
 
 chmod +x "$INSTALL_DIR/sherlook.sh"
 
 echo "[+] Creating sherlook command..."
-
 cat > /usr/local/bin/sherlook <<EOF
 #!/bin/bash
 exec "$INSTALL_DIR/sherlook.sh" "\$@"
 EOF
-
 chmod +x /usr/local/bin/sherlook
 
 echo
