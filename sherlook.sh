@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Sherlook Automate Engine v6.0 (PasarGuard API Edition)
-# Stability-focused rebuild with atomic updates, dynamic Tor-exit locations, and continuous auto-heal
+# Sherlook Automate Engine v6.1 (PasarGuard API Edition)
+# Stability-focused rebuild with atomic updates, full ISO locations, fast health checks, and continuous auto-heal
 
 # ================= COLORS =================
 RED='\033[1;31m'
@@ -20,15 +20,15 @@ INSTALL_PATH="/usr/local/bin/sherlook"
 RAW_BASE="https://raw.githubusercontent.com/SherlookHolmz/multi/main"
 RAW_ENGINE_URL="$RAW_BASE/sherlook.sh"
 RAW_INSTALLER_URL="$RAW_BASE/install.sh"
-SHERLOOK_VERSION="6.0.0"
+SHERLOOK_VERSION="6.1.0"
 LOCATION_CACHE="$DATA_DIR/onionoo_exit_countries.cache"
 LOCATION_CATALOG="$DATA_DIR/location_catalog.tsv"
 LOCATION_CACHE_TTL=21600
-AUTO_HEAL_INTERVAL=10
-AUTO_HEAL_PARALLEL=8
+AUTO_HEAL_INTERVAL=5
+AUTO_HEAL_PARALLEL=16
 NODE_ROTATE_RETRIES=12
-HEALTH_CONNECT_TIMEOUT=3
-HEALTH_MAX_TIME=8
+HEALTH_CONNECT_TIMEOUT=2
+HEALTH_MAX_TIME=5
 
 # Panel Config Cache
 PANEL_CONF="$BASE_DIR/pasargad_panel.conf"
@@ -105,6 +105,34 @@ declare -A LOW_SUPPLY_WARN=(
 )
 
 ORDER=({01..83})
+
+# v6.1: Keep all historical nodes/ports, then add every ISO-3166 alpha-2
+# country/territory available on the host. The menu does not depend on Onionoo.
+expand_iso_locations() {
+    local file="/usr/share/zoneinfo/iso3166.tab"
+    [ -r "$file" ] || return 0
+
+    local code name key existing next=83 port=9163
+    while read -r code name; do
+        [[ "$code" =~ ^[A-Z]{2}$ ]] || continue
+
+        local present=0
+        for key in "${!NODES[@]}"; do
+            IFS=':' read -r existing _ _ <<< "${NODES[$key]}"
+            if [ "$existing" = "$code" ]; then
+                present=1
+                break
+            fi
+        done
+        (( present )) && continue
+
+        next=$((next + 1))
+        NODES[$(printf '%02d' "$next")]="$code:${name:-$code}:$port"
+        ORDER+=("$(printf '%02d' "$next")")
+        port=$((port + 1))
+    done < "$file"
+}
+expand_iso_locations
 
 # ================= CORE FUNCTIONS =================
 
@@ -561,7 +589,7 @@ draw_header() {
     echo -e "${MAGENTA} ║${CYAN}   ╚════██║██╔══██║██╔══╝  ██╔══██╗██║     ██║   ██║██║   ██║██╔═██╗ ${MAGENTA} ║${NC}"
     echo -e "${MAGENTA} ║${CYAN}   ███████║██║  ██║███████╗██║  ██║███████╗╚██████╔╝╚██████╔╝██║  ██╗${MAGENTA} ║${NC}"
     echo -e "${MAGENTA} ║${CYAN}   ╚══════╝╚═╝  ╚═╝╚══════╝╚═╝  ╚═╝╚══════╝ ╚═════╝  ╚═════╝ ╚═╝  ╚═╝${MAGENTA} ║${NC}"
-    echo -e "${MAGENTA} ║${YELLOW}          A U T O M A T E   E N G I N E   V 6 . 0                   ${MAGENTA}║${NC}"
+    echo -e "${MAGENTA} ║${YELLOW}          A U T O M A T E   E N G I N E   V 6 . 1                   ${MAGENTA}║${NC}"
     echo -e "${MAGENTA} ╚════════════════════════════════════════════════════════╝${NC}"
     echo ""
 }
