@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Sherlook Automate Engine v5.0 (PasarGuard API Edition)
-# Fork/rebuild of "Tor Automate Engine" — renamed + debugged + expanded
+# Sherlook Automate Engine v6.0 (PasarGuard API Edition)
+# Stability-focused rebuild with atomic updates, dynamic Tor-exit locations, and continuous auto-heal
 
 # ================= COLORS =================
 RED='\033[1;31m'
@@ -15,6 +15,20 @@ NC='\033[0m'
 # ================= CONFIG =================
 BASE_DIR="/etc/tor/sherlook_nodes"
 DATA_DIR="/var/lib/tor/sherlook_nodes"
+SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
+INSTALL_PATH="/usr/local/bin/sherlook"
+RAW_BASE="https://raw.githubusercontent.com/SherlookHolmz/multi/main"
+RAW_ENGINE_URL="$RAW_BASE/sherlook.sh"
+RAW_INSTALLER_URL="$RAW_BASE/install.sh"
+SHERLOOK_VERSION="6.0.0"
+LOCATION_CACHE="$DATA_DIR/onionoo_exit_countries.cache"
+LOCATION_CATALOG="$DATA_DIR/location_catalog.tsv"
+LOCATION_CACHE_TTL=21600
+AUTO_HEAL_INTERVAL=10
+AUTO_HEAL_PARALLEL=8
+NODE_ROTATE_RETRIES=12
+HEALTH_CONNECT_TIMEOUT=3
+HEALTH_MAX_TIME=8
 
 # Panel Config Cache
 PANEL_CONF="$BASE_DIR/pasargad_panel.conf"
@@ -93,6 +107,159 @@ declare -A LOW_SUPPLY_WARN=(
 ORDER=({01..83})
 
 # ================= CORE FUNCTIONS =================
+
+is_valid_ipv4() {
+    local ip="${1//$'\r'/}"
+    ip="${ip//$'\n'/}"
+    [[ "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || return 1
+    local IFS='.' octet
+    read -r -a octets <<< "$ip"
+    for octet in "${octets[@]}"; do
+        (( 10#$octet <= 255 )) || return 1
+    done
+    return 0
+}
+
+command_or_empty() {
+    command -v "$1" 2>/dev/null || true
+}
+
+run_tor_node() {
+    local conf="$1"
+    if id debian-tor >/dev/null 2>&1 && command -v runuser >/dev/null 2>&1; then
+        runuser -u debian-tor -- tor -f "$conf" >/dev/null 2>&1 &
+    elif id debian-tor >/dev/null 2>&1 && command -v sudo >/dev/null 2>&1; then
+        sudo -u debian-tor tor -f "$conf" >/dev/null 2>&1 &
+    else
+        tor -f "$conf" >/dev/null 2>&1 &
+    fi
+}
+
+node_process_running() {
+    local code="$1" port="$2"
+    pgrep -f "node_${code}_${port}\.conf" >/dev/null 2>&1
+}
+
+append_bad_ip() {
+    local bad_file="$1" ip="$2"
+    is_valid_ipv4 "$ip" || return 0
+    mkdir -p "$(dirname "$bad_file")"
+    touch "$bad_file"
+    grep -qxF "$ip" "$bad_file" 2>/dev/null || echo "$ip" >> "$bad_file"
+    sort -u -o "$bad_file" "$bad_file" 2>/dev/null || true
+}
+
+country_name() {
+    local code="${1^^}"
+    local name=""
+    if [ -r /usr/share/zoneinfo/iso3166.tab ]; then
+        name=$(awk -v c="$code" '$1==c{$1=""; sub(/^ /,""); print; exit}' /usr/share/zoneinfo/iso3166.tab 2>/dev/null || true)
+    fi
+    [ -n "$name" ] && printf '%s\n' "$name" || printf '%s\n' "$code"
+}
+
+emoji_for_country() {
+    local code="${1^^}"
+    printf '%s' "${EMOJIS[$code]:-🌐}"
+}
+
+sync_dynamic_locations() {
+    mkdir -p "$DATA_DIR" "$BASE_DIR"
+
+    # First load previously discovered locations/ports so installed nodes never
+    # change port merely because Onionoo temporarily reports a different set.
+    local catalog_code catalog_name catalog_port catalog_idx line
+    local max_port=9080 next_idx=0 key n
+    for key in "${!NODES[@]}"; do
+        n=$((10#$key)); (( n > next_idx )) && next_idx=$n
+        IFS=':' read -r _ _ catalog_port <<< "${NODES[$key]}"
+        [[ "$catalog_port" =~ ^[0-9]+$ ]] && (( catalog_port > max_port )) && max_port=$catalog_port
+    done
+
+    if [ -s "$LOCATION_CATALOG" ]; then
+        while IFS=$'\\t' read -r catalog_code catalog_name catalog_port; do
+            [[ "$catalog_code" =~ ^[A-Z]{2}$ ]] || continue
+            [[ "$catalog_port" =~ ^[0-9]+$ ]] || continue
+            local present=0
+            for key in "${!NODES[@]}"; do
+                IFS=':' read -r existing_code _ _ <<< "${NODES[$key]}"
+                if [ "$existing_code" = "$catalog_code" ]; then present=1; break; fi
+            done
+            (( present )) && continue
+            next_idx=$((next_idx+1))
+            NODES[$(printf '%02d' "$next_idx")]="$catalog_code:${catalog_name:-$catalog_code}:$catalog_port"
+            (( catalog_port > max_port )) && max_port=$catalog_port
+        done < "$LOCATION_CATALOG"
+    fi
+
+    local now cache_mtime stale=1
+    if [ -s "$LOCATION_CACHE" ]; then
+        cache_mtime=$(stat -c %Y "$LOCATION_CACHE" 2>/dev/null || echo 0)
+        now=$(date +%s)
+        if (( now - cache_mtime < LOCATION_CACHE_TTL )); then stale=0; fi
+    fi
+
+    if (( stale )); then
+        local tmp
+        tmp=$(mktemp /tmp/sherlook_country.XXXXXX) || return 0
+        if curl -4 -fsS --connect-timeout 5 --max-time "$ONIONOO_TIMEOUT" \
+            "${ONIONOO_URL}?flag=Exit&running=true&fields=country" -o "$tmp" 2>/dev/null; then
+            jq -r '.relays // [] | .[].country // empty' "$tmp" 2>/dev/null \
+                | tr '[:lower:]' '[:upper:]' \
+                | grep -E '^[A-Z]{2}$' | sort -u > "$LOCATION_CACHE.tmp" || true
+            if [ -s "$LOCATION_CACHE.tmp" ]; then mv -f "$LOCATION_CACHE.tmp" "$LOCATION_CACHE"; fi
+        fi
+        rm -f "$tmp" "$LOCATION_CACHE.tmp"
+    fi
+
+    # Add every country currently reporting at least one running Tor exit.
+    if [ -s "$LOCATION_CACHE" ]; then
+        while IFS= read -r catalog_code; do
+            [ -z "$catalog_code" ] && continue
+            local present=0
+            for key in "${!NODES[@]}"; do
+                IFS=':' read -r existing_code _ _ <<< "${NODES[$key]}"
+                if [ "$existing_code" = "$catalog_code" ]; then present=1; break; fi
+            done
+            (( present )) && continue
+
+            next_idx=$((next_idx+1))
+            max_port=$((max_port+1))
+            catalog_name=$(country_name "$catalog_code")
+            NODES[$(printf '%02d' "$next_idx")]="$catalog_code:$catalog_name:$max_port"
+            EMOJIS[$catalog_code]="$(emoji_for_country "$catalog_code")"
+            printf '%s\\t%s\\t%s\\n' "$catalog_code" "$catalog_name" "$max_port" >> "$LOCATION_CATALOG"
+        done < "$LOCATION_CACHE"
+    fi
+
+    # Also persist statically defined locations once, while leaving their
+    # original ports untouched.
+    : > "$LOCATION_CATALOG.tmp"
+    for key in "${!NODES[@]}"; do
+        IFS=':' read -r catalog_code catalog_name catalog_port <<< "${NODES[$key]}"
+        printf '%s\\t%s\\t%s\\n' "$catalog_code" "$catalog_name" "$catalog_port" >> "$LOCATION_CATALOG.tmp"
+    done
+    sort -t $'\\t' -k1,1 -u "$LOCATION_CATALOG.tmp" > "$LOCATION_CATALOG" 2>/dev/null || mv -f "$LOCATION_CATALOG.tmp" "$LOCATION_CATALOG"
+    rm -f "$LOCATION_CATALOG.tmp"
+
+    mapfile -t ORDER < <(printf '%s\\n' "${!NODES[@]}" | sort -n)
+}
+
+acquire_node_lock() {
+    local code="$1" port="$2"
+    local lock_file="$DATA_DIR/${code}_${port}/node.lock"
+    mkdir -p "$(dirname "$lock_file")"
+    exec {NODE_LOCK_FD}>"$lock_file"
+    flock -n "$NODE_LOCK_FD"
+}
+
+release_node_lock() {
+    if [[ -n "${NODE_LOCK_FD:-}" ]]; then
+        flock -u "$NODE_LOCK_FD" 2>/dev/null || true
+        eval "exec ${NODE_LOCK_FD}>&-" 2>/dev/null || true
+        unset NODE_LOCK_FD
+    fi
+}
 
 check_root() {
     if [ "$EUID" -ne 0 ]; then
@@ -282,86 +449,105 @@ Log err file $inst_data_dir/notices.log
 EOF
 }
 
-background_auto_heal() {
-    for idx in "${ORDER[@]}"; do
-        local details="${NODES[$idx]}"
-        IFS=':' read -r code name out_port <<< "$details"
+health_check_node() {
+    local code="$1" name="$2" out_port="$3" silent="${4:-1}"
+    local conf_file="$BASE_DIR/node_${code}_${out_port}.conf"
+    local inst_data_dir="$DATA_DIR/${code}_${out_port}"
+    local ip_file="$inst_data_dir/last_ip.txt"
+    [ -f "$conf_file" ] || return 0
 
-        local inst_data_dir="$DATA_DIR/${code}_${out_port}"
-        local conf_file="$BASE_DIR/node_${code}_${out_port}.conf"
-        local ip_file="$inst_data_dir/last_ip.txt"
-        local ctrl_file="$inst_data_dir/control.env"
-        local bad_file="$inst_data_dir/bad_exits.txt"
+    if ! acquire_node_lock "$code" "$out_port"; then
+        return 3
+    fi
 
-        if [ ! -f "$conf_file" ]; then continue; fi
+    local current_ip="" old_ip="" result bad actual reason seen
+    [ -s "$ip_file" ] && old_ip=$(head -n1 "$ip_file" | tr -d '\r\n')
 
-        local is_dead=0
-        if ! pgrep -f "node_${code}_${out_port}.conf" > /dev/null; then
-            is_dead=1
+    if ! node_process_running "$code" "$out_port"; then
+        [ "$silent" = "1" ] || echo -e "${YELLOW}[!] $code process is down; rotating immediately.${NC}"
+        release_node_lock
+        rotate_one_node "$code" "$name" "$out_port" "$silent"
+        return $?
+    fi
+
+    current_ip=$(get_node_ip "$out_port")
+    if ! is_valid_ipv4 "$current_ip"; then
+        # Two fast probes avoid rotating for a single transient ipify failure,
+        # but any persistent non-IP/Waiting/empty response rotates immediately.
+        sleep 1
+        current_ip=$(get_node_ip "$out_port")
+    fi
+
+    if ! is_valid_ipv4 "$current_ip"; then
+        [ "$silent" = "1" ] || echo -e "${RED}[!] $code returned no valid public IP; rotating now.${NC}"
+        release_node_lock
+        rotate_one_node "$code" "$name" "$out_port" "$silent"
+        return $?
+    fi
+
+    if [ "$current_ip" != "$old_ip" ] || ! is_valid_ipv4 "$old_ip"; then
+        result=$(check_ip_quality "$current_ip" "$code")
+        IFS='|' read -r bad actual reason seen <<< "$result"
+        if [ "$bad" = "0" ]; then
+            printf '%s\n' "$current_ip" > "$ip_file"
+            release_node_lock
+            return 0
         fi
+        append_bad_ip "$inst_data_dir/bad_exits.txt" "$current_ip"
+        [ "$silent" = "1" ] || echo -e "${RED}[!] $code rejected IP $current_ip ($reason); rotating now.${NC}"
+        release_node_lock
+        rotate_one_node "$code" "$name" "$out_port" "$silent"
+        return $?
+    fi
 
-        local control_port="" ctrl_pass=""
-        if [ -f "$ctrl_file" ]; then
-            source "$ctrl_file" 2>/dev/null || true
-            control_port="$CTRL_PORT"
-            ctrl_pass="$CTRL_PASS"
-        fi
-
-        if [ $is_dead -eq 0 ]; then
-            local test_ip
-            test_ip=$(curl -s --socks5-hostname 127.0.0.1:"$out_port" https://api.ipify.org --connect-timeout 5 --max-time 20 || true)
-            if [[ ! "$test_ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-                is_dead=1
-            else
-                local result
-                result=$(check_ip_quality "$test_ip" "$code")
-                local bad="${result%%|*}"
-                if [ "$bad" == "1" ]; then
-                    if ! grep -qxF "$test_ip" "$bad_file" 2>/dev/null; then
-                        echo "$test_ip" >> "$bad_file"
-                        sort -u -o "$bad_file" "$bad_file" 2>/dev/null || true
-                    fi
-                    is_dead=1
-                else
-                    echo "$test_ip" > "$ip_file"
-                fi
-            fi
-        fi
-
-        if [ $is_dead -eq 1 ]; then
-            pkill -f "node_${code}_${out_port}.conf" 2>/dev/null || true
-            rm -f "$ip_file"
-            if [ -n "$control_port" ]; then
-                write_node_conf "$conf_file" "$out_port" "$control_port" "${HASHED_PASS:-}" "$inst_data_dir" "$code"
-            fi
-            sudo -u debian-tor tor -f "$conf_file" >/dev/null 2>&1 &
-
-            (
-                sleep 15
-                local new_ip
-                new_ip=$(curl -s --socks5-hostname 127.0.0.1:"$out_port" https://api.ipify.org --connect-timeout 5 --max-time 20 || true)
-                if [[ "$new_ip" =~ ^[0-9]+(\.[0-9]+){3}$ ]]; then
-                    local heal_result heal_bad
-                    heal_result=$(check_ip_quality "$new_ip" "$code")
-                    heal_bad="${heal_result%%|*}"
-                    if [ "$heal_bad" == "0" ]; then
-                        echo "$new_ip" > "$ip_file"
-                    else
-                        if ! grep -qxF "$new_ip" "$bad_file" 2>/dev/null; then
-                            echo "$new_ip" >> "$bad_file"
-                            sort -u -o "$bad_file" "$bad_file" 2>/dev/null || true
-                        fi
-                        rm -f "$ip_file"
-                    fi
-                fi
-            ) &
-        fi
-    done
-    exit 0
+    release_node_lock
+    return 0
 }
 
-if [ "$1" == "--auto-heal" ]; then
+background_auto_heal() {
+    check_root
+    sync_dynamic_locations
+    local idx details code name out_port
+    local -a pids=()
+    local running=0
+
+    for idx in "${ORDER[@]}"; do
+        details="${NODES[$idx]}"
+        IFS=':' read -r code name out_port <<< "$details"
+        [ -f "$BASE_DIR/node_${code}_${out_port}.conf" ] || continue
+        health_check_node "$code" "$name" "$out_port" 1 &
+        pids+=("$!")
+        running=$((running+1))
+        if (( running >= AUTO_HEAL_PARALLEL )); then
+            wait "${pids[0]}" 2>/dev/null || true
+            pids=("${pids[@]:1}")
+            running=$((running-1))
+        fi
+    done
+    for pid in "${pids[@]}"; do wait "$pid" 2>/dev/null || true; done
+}
+
+auto_heal_daemon() {
+    check_root
+    trap 'exit 0' INT TERM HUP
+    while true; do
+        background_auto_heal
+        sleep "$AUTO_HEAL_INTERVAL"
+    done
+}
+
+if [ "${1:-}" = "--version" ]; then
+    printf '%s\n' "$SHERLOOK_VERSION"
+    exit 0
+fi
+
+if [ "${1:-}" = "--auto-heal" ]; then
     background_auto_heal
+    exit 0
+fi
+if [ "${1:-}" = "--auto-heal-daemon" ]; then
+    auto_heal_daemon
+    exit 0
 fi
 
 # ================= UI FUNCTIONS =================
@@ -375,7 +561,7 @@ draw_header() {
     echo -e "${MAGENTA} ║${CYAN}   ╚════██║██╔══██║██╔══╝  ██╔══██╗██║     ██║   ██║██║   ██║██╔═██╗ ${MAGENTA} ║${NC}"
     echo -e "${MAGENTA} ║${CYAN}   ███████║██║  ██║███████╗██║  ██║███████╗╚██████╔╝╚██████╔╝██║  ██╗${MAGENTA} ║${NC}"
     echo -e "${MAGENTA} ║${CYAN}   ╚══════╝╚═╝  ╚═╝╚══════╝╚═╝  ╚═╝╚══════╝ ╚═════╝  ╚═════╝ ╚═╝  ╚═╝${MAGENTA} ║${NC}"
-    echo -e "${MAGENTA} ║${YELLOW}          A U T O M A T E   E N G I N E   V 5 . 0                   ${MAGENTA}║${NC}"
+    echo -e "${MAGENTA} ║${YELLOW}          A U T O M A T E   E N G I N E   V 6 . 0                   ${MAGENTA}║${NC}"
     echo -e "${MAGENTA} ╚════════════════════════════════════════════════════════╝${NC}"
     echo ""
 }
@@ -442,7 +628,7 @@ EOF
     fi
 
     echo -e "${CYAN}[*] Routing ${WHITE}$code - $name ${CYAN}➔ Tor Port: ${MAGENTA}$out_port${CYAN}. Please wait...${NC}"
-    sudo -u debian-tor tor -f "$conf_file" >/dev/null 2>&1 &
+    run_tor_node "$conf_file"
     draw_progress "Bootstrapping Tor connection"
 
     local connect_attempts=0
@@ -498,7 +684,7 @@ EOF
             write_node_conf "$conf_file" "$out_port" "$control_port" "$hashed_pass" "$inst_data_dir" "$code"
             pkill -f "node_${code}_${out_port}.conf" 2>/dev/null || true
             sleep 2
-            sudo -u debian-tor tor -f "$conf_file" >/dev/null 2>&1 &
+            run_tor_node "$conf_file"
             sleep 7
             newnym_tries=0
         fi
@@ -512,12 +698,25 @@ EOF
 
 # ================= IP ROTATION =================
 get_node_ip() {
-    local out_port="$1"
-    curl -4 -sS --socks5-hostname "127.0.0.1:${out_port}" \
-      https://api.ipify.org --connect-timeout 3 --max-time 7 2>/dev/null | tr -d '\r\n\0'
+    local out_port="$1" value endpoint
+    local -a endpoints=(
+        "https://api.ipify.org"
+        "https://checkip.amazonaws.com"
+        "https://ifconfig.me/ip"
+    )
+    for endpoint in "${endpoints[@]}"; do
+        value=$(curl -4 -sS --socks5-hostname "127.0.0.1:${out_port}" \
+            "$endpoint" --connect-timeout "$HEALTH_CONNECT_TIMEOUT" --max-time "$HEALTH_MAX_TIME" 2>/dev/null \
+            | tr -d '\r\n\0' || true)
+        if is_valid_ipv4 "$value"; then
+            printf '%s\n' "$value"
+            return 0
+        fi
+    done
+    return 1
 }
 
-rotate_one_node() {
+rotate_one_node_core() {
     local code="$1" name="$2" out_port="$3" silent="${4:-0}"
     local conf_file="$BASE_DIR/node_${code}_${out_port}.conf"
     local inst_data_dir="$DATA_DIR/${code}_${out_port}"
@@ -531,62 +730,73 @@ rotate_one_node() {
     [ -s "$ip_file" ] && old_ip=$(head -n1 "$ip_file" | tr -d '\r\n')
     [ "$silent" = "1" ] || echo -e "${CYAN}🔄 $code - $name: changing IP...${NC}"
 
-    send_newnym "$CTRL_PORT" "$CTRL_PASS" || true
-
     local attempt new_ip result bad actual reason seen
-    for attempt in {1..6}; do
-        sleep 3
+    for attempt in $(seq 1 "$NODE_ROTATE_RETRIES"); do
+        send_newnym "$CTRL_PORT" "$CTRL_PASS" || true
+        sleep $((attempt <= 3 ? 2 : 4))
         new_ip=$(get_node_ip "$out_port")
-        if [[ "$new_ip" =~ ^[0-9]+(\.[0-9]+){3}$ ]] && [ "$new_ip" != "$old_ip" ]; then
+
+        if is_valid_ipv4 "$new_ip"; then
+            if [ "$new_ip" = "$old_ip" ]; then
+                continue
+            fi
             result=$(check_ip_quality "$new_ip" "$code")
             IFS='|' read -r bad actual reason seen <<< "$result"
             if [ "$bad" = "0" ]; then
-                echo "$new_ip" > "$ip_file"
+                printf '%s\n' "$new_ip" > "$ip_file"
                 [ "$silent" = "1" ] || echo -e "${GREEN}  ✓ $code → $new_ip${NC}"
                 return 0
             fi
-            if [ "$reason" = "COUNTRY_MISMATCH" ] || [ "$reason" = "HIGH_RISK" ]; then
-                mkdir -p "$inst_data_dir"; touch "$bad_file"
-                grep -qxF "$new_ip" "$bad_file" 2>/dev/null || echo "$new_ip" >> "$bad_file"
-                sort -u -o "$bad_file" "$bad_file" 2>/dev/null || true
-            fi
+            append_bad_ip "$bad_file" "$new_ip"
+            [ "$silent" = "1" ] || echo -e "${RED}  ✗ $code rejected $new_ip: $reason${NC}"
+        else
+            [ "$silent" = "1" ] || echo -e "${YELLOW}  • $code still has no valid IP (attempt $attempt/$NODE_ROTATE_RETRIES)${NC}"
         fi
-        send_newnym "$CTRL_PORT" "$CTRL_PASS" || true
     done
 
-    [ -n "$old_ip" ] && {
-        touch "$bad_file"
-        grep -qxF "$old_ip" "$bad_file" 2>/dev/null || echo "$old_ip" >> "$bad_file"
-    }
+    # Escalate: fully rebuild Tor with known-bad exits excluded.
+    if is_valid_ipv4 "$old_ip"; then append_bad_ip "$bad_file" "$old_ip"; fi
     write_node_conf "$conf_file" "$out_port" "$CTRL_PORT" "$HASHED_PASS" "$inst_data_dir" "$code"
-    pkill -f "node_${code}_${out_port}.conf" 2>/dev/null || true
+    pkill -f "node_${code}_${out_port}\.conf" 2>/dev/null || true
     sleep 1
-    sudo -u debian-tor tor -f "$conf_file" >/dev/null 2>&1 &
+    run_tor_node "$conf_file"
 
-    for attempt in {1..8}; do
+    for attempt in $(seq 1 "$NODE_ROTATE_RETRIES"); do
         sleep 2
         new_ip=$(get_node_ip "$out_port")
-        if [[ "$new_ip" =~ ^[0-9]+(\.[0-9]+){3}$ ]] && [ "$new_ip" != "$old_ip" ]; then
+        if is_valid_ipv4 "$new_ip"; then
+            [ "$new_ip" != "$old_ip" ] || continue
             result=$(check_ip_quality "$new_ip" "$code")
             IFS='|' read -r bad actual reason seen <<< "$result"
             if [ "$bad" = "0" ]; then
-                echo "$new_ip" > "$ip_file"
-                [ "$silent" = "1" ] || echo -e "${GREEN}  ✓ $code → $new_ip${NC}"
+                printf '%s\n' "$new_ip" > "$ip_file"
+                [ "$silent" = "1" ] || echo -e "${GREEN}  ✓ $code → $new_ip (full restart)${NC}"
                 return 0
             fi
-            if [ "$reason" = "COUNTRY_MISMATCH" ] || [ "$reason" = "HIGH_RISK" ]; then
-                touch "$bad_file"
-                grep -qxF "$new_ip" "$bad_file" 2>/dev/null || echo "$new_ip" >> "$bad_file"
-                sort -u -o "$bad_file" "$bad_file" 2>/dev/null || true
-            fi
+            append_bad_ip "$bad_file" "$new_ip"
             write_node_conf "$conf_file" "$out_port" "$CTRL_PORT" "$HASHED_PASS" "$inst_data_dir" "$code"
-            pkill -f "node_${code}_${out_port}.conf" 2>/dev/null || true
+            pkill -f "node_${code}_${out_port}\.conf" 2>/dev/null || true
             sleep 1
-            sudo -u debian-tor tor -f "$conf_file" >/dev/null 2>&1 &
+            run_tor_node "$conf_file"
         fi
     done
-    [ "$silent" = "1" ] || echo -e "${RED}  ✗ $code: no verified new IP found.${NC}"
+
+    rm -f "$ip_file"
+    echo "$(date '+%Y-%m-%d %H:%M:%S') rotation failed for $code" >> "$inst_data_dir/heal_fail.log"
+    [ "$silent" = "1" ] || echo -e "${RED}  ✗ $code: no verified replacement IP found.${NC}"
     return 1
+}
+
+rotate_one_node() {
+    local code="$1" name="$2" out_port="$3" silent="${4:-0}"
+    if ! acquire_node_lock "$code" "$out_port"; then
+        [ "$silent" = "1" ] || echo -e "${YELLOW}[!] $code is already being repaired; skipping duplicate rotation.${NC}"
+        return 3
+    fi
+    rotate_one_node_core "$code" "$name" "$out_port" "$silent"
+    local rc=$?
+    release_node_lock
+    return $rc
 }
 
 change_ip_menu() {
@@ -648,23 +858,116 @@ install_engine() {
     draw_header
     echo -e "${YELLOW}[*] Updating package lists...${NC}"
     apt-get update -qq
-    echo -e "${YELLOW}[*] Installing prerequisites (Tor, Curl, JQ, Nano, OpenSSL, Zip, Cron)...${NC}"
-    apt-get install -y tor tor-geoipdb curl jq nano openssl unzip zip cron ca-certificates
+    echo -e "${YELLOW}[*] Installing prerequisites...${NC}"
+    DEBIAN_FRONTEND=noninteractive apt-get install -y \
+        tor tor-geoipdb curl jq nano openssl unzip zip cron ca-certificates util-linux
+
     systemctl stop tor 2>/dev/null || true
     systemctl disable tor 2>/dev/null || true
-    mkdir -p "$BASE_DIR"
-    mkdir -p "$DATA_DIR"
+    mkdir -p "$BASE_DIR" "$DATA_DIR"
     chown -R debian-tor:debian-tor "$DATA_DIR" 2>/dev/null || true
 
-    cp "$0" /usr/local/bin/sherlook
-    chmod +x /usr/local/bin/sherlook
-    echo "*/30 * * * * root /usr/local/bin/sherlook --auto-heal > /dev/null 2>&1" > /etc/cron.d/sherlook_heal
-    chmod 644 /etc/cron.d/sherlook_heal
+    # Install the exact currently-running engine atomically.
+    local source="$SCRIPT_PATH"
+    [ -f "$source" ] || { echo -e "${RED}[!] Cannot locate engine source: $source${NC}"; return 1; }
+    bash -n "$source" || { echo -e "${RED}[!] Engine syntax check failed; refusing to install.${NC}"; return 1; }
+    install -m 755 "$source" "$INSTALL_PATH"
+    install -d -m 755 /root/.sherlook
+    install -m 755 "$source" /root/.sherlook/sherlook.sh
+
+    cat > /etc/systemd/system/sherlook-heal.service <<EOF
+[Unit]
+Description=Sherlook Continuous Tor Node Health and IP Auto-Heal
+After=network-online.target tor.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=$INSTALL_PATH --auto-heal-daemon
+Restart=always
+RestartSec=2
+User=root
+MemoryMax=256M
+NoNewPrivileges=false
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+    systemctl daemon-reload
+    systemctl enable --now sherlook-heal.service
+    sync_dynamic_locations || true
+    echo "*/15 * * * * root systemctl is-active --quiet sherlook-heal.service || systemctl restart sherlook-heal.service" > /etc/cron.d/sherlook_watchdog
+    chmod 644 /etc/cron.d/sherlook_watchdog
     systemctl restart cron 2>/dev/null || true
 
-    echo -e "${GREEN}[+] Engine & Core Tools Installed Successfully! Background Auto-Heal is Active.${NC}"
-    echo -e "${GREEN}[+] Auto-heal now also re-verifies exit country every 30 min, not just uptime.${NC}"
-    sleep 3
+    echo -e "${GREEN}[+] Sherlook v${SHERLOOK_VERSION} installed successfully.${NC}"
+    echo -e "${GREEN}[+] Continuous Auto-Heal is active (~${AUTO_HEAL_INTERVAL}s scan interval).${NC}"
+    echo -e "${GREEN}[+] Invalid/Waiting/non-IP output triggers immediate IP rotation/rebuild.${NC}"
+    sleep 2
+}
+
+update_system() {
+    check_root
+    draw_header
+    echo -e "${CYAN}[*] Sherlook Update — current v${SHERLOOK_VERSION}${NC}"
+
+    local tmp tmp_installer remote_version
+    tmp=$(mktemp /tmp/sherlook_update.XXXXXX) || return 1
+    tmp_installer=$(mktemp /tmp/sherlook_installer_update.XXXXXX) || { rm -f "$tmp"; return 1; }
+    if ! curl -4 -fL --retry 5 --retry-delay 1 --connect-timeout 10 --max-time 60 \
+        -o "$tmp" "$RAW_ENGINE_URL"; then
+        echo -e "${RED}[!] Update download failed.${NC}"
+        rm -f "$tmp" "$tmp_installer"
+        return 1
+    fi
+
+    if ! head -n1 "$tmp" | grep -q '^#!'; then
+        echo -e "${RED}[!] Remote payload is not a shell script; refusing update.${NC}"
+        rm -f "$tmp"
+        return 1
+    fi
+    if ! bash -n "$tmp"; then
+        echo -e "${RED}[!] Remote script failed bash syntax validation; refusing update.${NC}"
+        rm -f "$tmp" "$tmp_installer"
+        return 1
+    fi
+
+    if curl -4 -fL --retry 3 --connect-timeout 10 --max-time 60 -o "$tmp_installer" "$RAW_INSTALLER_URL" 2>/dev/null; then
+        if ! head -n1 "$tmp_installer" | grep -q '^#!' || ! bash -n "$tmp_installer"; then
+            rm -f "$tmp_installer"
+            tmp_installer=""
+        fi
+    else
+        rm -f "$tmp_installer"
+        tmp_installer=""
+    fi
+
+    remote_version=$(grep -m1 '^SHERLOOK_VERSION=' "$tmp" | sed -E 's/^SHERLOOK_VERSION="([^"]+)"/\1/' || true)
+    [ -n "$remote_version" ] || remote_version="unknown"
+    echo -e "${GREEN}[+] Remote version: ${remote_version}${NC}"
+
+    local backup="$BASE_DIR/sherlook.sh.bak.$(date +%Y%m%d_%H%M%S)"
+    mkdir -p "$BASE_DIR" /root/.sherlook
+    if [ -f "$INSTALL_PATH" ]; then cp -a "$INSTALL_PATH" "$backup"; fi
+
+    install -m 755 "$tmp" "$INSTALL_PATH.new"
+    mv -f "$INSTALL_PATH.new" "$INSTALL_PATH"
+    install -m 755 "$tmp" /root/.sherlook/sherlook.sh
+    rm -f "$tmp"
+    if [ -n "$tmp_installer" ] && [ -f "$tmp_installer" ]; then
+        install -m 755 "$tmp_installer" /root/.sherlook/install.sh
+        install -m 755 "$tmp_installer" /usr/local/bin/sherlook-install
+    fi
+    rm -f "$tmp_installer"
+
+    # Re-sync the service definition through the freshly installed script.
+    systemctl daemon-reload 2>/dev/null || true
+    systemctl restart sherlook-heal.service 2>/dev/null || true
+
+    echo -e "${GREEN}[+] Update installed atomically. Backup: $backup${NC}"
+    echo -e "${YELLOW}[*] Restarting Sherlook with the new engine...${NC}"
+    exec "$INSTALL_PATH"
 }
 
 uninstall_engine() {
@@ -679,14 +982,18 @@ uninstall_engine() {
     apt-get autoremove -y
     rm -rf "$BASE_DIR"
     rm -rf "$DATA_DIR"
-    rm -f /etc/cron.d/sherlook_heal
+    rm -f /etc/cron.d/sherlook_heal /etc/cron.d/sherlook_watchdog
+    systemctl disable --now sherlook-heal.service 2>/dev/null || true
+    rm -f /etc/systemd/system/sherlook-heal.service
+    systemctl daemon-reload 2>/dev/null || true
     rm -f /usr/local/bin/sherlook
     echo -e "${GREEN}[+] Uninstallation complete.${NC}"
     exit 0
 }
 
 list_locations() {
-    echo -e "${YELLOW}Available Locations:${NC}\n"
+    sync_dynamic_locations || true
+    echo -e "${YELLOW}Available Tor Exit Locations (dynamic + built-in):${NC}\n"
 
     local C_CYAN='\033[1;36m'
     local C_GREEN='\033[1;32m'
@@ -872,85 +1179,36 @@ bulk_add_nodes() {
 }
 
 view_active_nodes() {
+    check_root
     while true; do
         draw_header
-        echo -e "${CYAN}» Option 6 - Active Nodes Monitor (Instant View Mode)${NC}"
-        echo -e "${YELLOW}[*] Live monitoring... Fetching data directly from cache without active API checks.${NC}\n"
-
+        sync_dynamic_locations
+        echo -e "${CYAN}» Option 6 - Active Nodes Monitor${NC}"
+        echo -e "${YELLOW}[*] Health daemon checks every ${AUTO_HEAL_INTERVAL}s. This screen only reads current state.${NC}\n"
         echo -e "${BLUE}┌──────┬──────┬──────────────────────┬─────────────┬──────────────┬──────────────────┐${NC}"
         echo -e "${BLUE}│${WHITE} ID   ${BLUE}│${WHITE} CC   ${BLUE}│${WHITE} Location             ${BLUE}│${WHITE} Tor Port    ${BLUE}│${WHITE} Status       ${BLUE}│${WHITE} Live IP          ${BLUE}│${NC}"
         echo -e "${BLUE}├──────┼──────┼──────────────────────┼─────────────┼──────────────┼──────────────────┤${NC}"
 
-        local found=0
+        local found=0 idx details code name out_port display_ip status
         for idx in "${ORDER[@]}"; do
-            local details="${NODES[$idx]}"
+            details="${NODES[$idx]}"
             IFS=':' read -r code name out_port <<< "$details"
-
-            local conf_file="$BASE_DIR/node_${code}_${out_port}.conf"
+            [ -f "$BASE_DIR/node_${code}_${out_port}.conf" ] || continue
+            found=1
+            display_ip="Waiting..."
             local ip_file="$DATA_DIR/${code}_${out_port}/last_ip.txt"
-
-            if [ -f "$conf_file" ] && ! node_is_installed "$code" "$out_port"; then
-                rm -f "$ip_file"
-            fi
-
-            if [ -f "$conf_file" ]; then
-                found=1
-
-                local display_ip="Waiting..."
-                if [ -f "$ip_file" ] && [ -s "$ip_file" ]; then
-                    display_ip=$(cat "$ip_file")
-                fi
-
-                if pgrep -f "node_${code}_${out_port}.conf" > /dev/null; then
-                    printf "${BLUE}│ ${CYAN}%-4s ${BLUE}│ ${WHITE}%-4s ${BLUE}│ ${WHITE}%-20s ${BLUE}│ ${MAGENTA}%-11s ${BLUE}│ ${GREEN}%-12s ${BLUE}│ ${GREEN}%-16s ${BLUE}│${NC}\n" "$idx" "$code" "$name" "$out_port" "ONLINE" "$display_ip"
-                else
-                    local heal_lock="$DATA_DIR/${code}_${out_port}/healing.lock"
-
-                    if [ -f "$heal_lock" ] && kill -0 "$(cat "$heal_lock" 2>/dev/null)" 2>/dev/null; then
-                        # A healer for this node is already running from a
-                        # previous screen refresh — don't stack another one.
-                        printf "${BLUE}│ ${CYAN}%-4s ${BLUE}│ ${WHITE}%-4s ${BLUE}│ ${WHITE}%-20s ${BLUE}│ ${MAGENTA}%-11s ${BLUE}│ ${YELLOW}%-12s ${BLUE}│ ${YELLOW}%-16s ${BLUE}│${NC}\n" "$idx" "$code" "$name" "$out_port" "HEALING..." "Restarting..."
-                    else
-                        rm -f "$ip_file"
-                        sudo -u debian-tor tor -f "$conf_file" >/dev/null 2>&1 &
-
-                        printf "${BLUE}│ ${CYAN}%-4s ${BLUE}│ ${WHITE}%-4s ${BLUE}│ ${WHITE}%-20s ${BLUE}│ ${MAGENTA}%-11s ${BLUE}│ ${YELLOW}%-12s ${BLUE}│ ${YELLOW}%-16s ${BLUE}│${NC}\n" "$idx" "$code" "$name" "$out_port" "HEALING..." "Restarting..."
-
-                        (
-                            echo $BASHPID > "$heal_lock"
-                            local heal_try=0
-                            local heal_max=15
-                            while [ "$heal_try" -lt "$heal_max" ]; do
-                                sleep 8
-                                local new_ip=$(curl -s --socks5-hostname 127.0.0.1:$out_port https://api.ipify.org --connect-timeout 5 --max-time 20 || true)
-                                if [[ "$new_ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-                                    echo "$new_ip" > "$ip_file"
-                                    break
-                                fi
-                                heal_try=$((heal_try+1))
-                                pkill -HUP -f "node_${code}_${out_port}.conf" 2>/dev/null || true
-                            done
-                            if [ "$heal_try" -ge "$heal_max" ]; then
-                                echo "$(date '+%Y-%m-%d %H:%M:%S') heal failed after $heal_max tries" >> "$DATA_DIR/${code}_${out_port}/heal_fail.log"
-                            fi
-                            rm -f "$heal_lock"
-                        ) &
-                    fi
-                fi
+            [ -s "$ip_file" ] && is_valid_ipv4 "$(head -n1 "$ip_file" | tr -d '\r\n')" && display_ip=$(head -n1 "$ip_file" | tr -d '\r\n')
+            if node_process_running "$code" "$out_port"; then status="ONLINE"; else status="HEALING"; fi
+            if [ "$status" = "ONLINE" ]; then
+                printf "${BLUE}│ ${CYAN}%-4s ${BLUE}│ ${WHITE}%-4s ${BLUE}│ ${WHITE}%-20s ${BLUE}│ ${MAGENTA}%-11s ${BLUE}│ ${GREEN}%-12s ${BLUE}│ ${GREEN}%-16s ${BLUE}│${NC}\n" "$idx" "$code" "$name" "$out_port" "$status" "$display_ip"
+            else
+                printf "${BLUE}│ ${CYAN}%-4s ${BLUE}│ ${WHITE}%-4s ${BLUE}│ ${WHITE}%-20s ${BLUE}│ ${MAGENTA}%-11s ${BLUE}│ ${YELLOW}%-12s ${BLUE}│ ${YELLOW}%-16s ${BLUE}│${NC}\n" "$idx" "$code" "$name" "$out_port" "$status" "$display_ip"
             fi
         done
-
-        if [ $found -eq 0 ]; then
-            printf "${BLUE}│ ${YELLOW}%-82s ${BLUE}│${NC}\n" "No active nodes found in the system."
-        fi
+        [ "$found" -eq 0 ] && printf "${BLUE}│ ${YELLOW}%-82s ${BLUE}│${NC}\n" "No installed nodes found."
         echo -e "${BLUE}└──────┴──────┴──────────────────────┴─────────────┴──────────────┴──────────────────┘${NC}\n"
-
-        echo -e "${MAGENTA}[ Live Monitoring Active ]${NC} Screen refreshes every 3 seconds."
-        echo -e "${WHITE}Press any key (or Enter) to stop monitoring and return to main menu...${NC}"
-
-        if read -t 3 -n 1 -s key; then
-            break
-        fi
+        echo -e "${MAGENTA}[ Continuous Health Monitor ]${NC} Refreshes every 3 seconds. Press any key to return."
+        if read -t 3 -n 1 -s key; then break; fi
     done
 }
 
@@ -1481,13 +1739,17 @@ panel_batch_create() {
 while true; do
     draw_header
     if command -v tor &> /dev/null && command -v jq &> /dev/null; then
-        echo -e "   ${WHITE}System Status:${NC} ${GREEN}Engine Ready${NC}"
+        if systemctl is-active --quiet sherlook-heal.service 2>/dev/null; then
+            echo -e "   ${WHITE}System Status:${NC} ${GREEN}Engine Ready + Auto-Heal Active${NC}"
+        else
+            echo -e "   ${WHITE}System Status:${NC} ${GREEN}Engine Ready${NC} ${YELLOW}(Auto-Heal service inactive)${NC}"
+        fi
     else
         echo -e "   ${WHITE}System Status:${NC} ${RED}Not Ready${NC}"
     fi
     echo -e "${BLUE} ────────────────────────────────────────────────────────${NC}"
     echo -e "  ${CYAN}[1]${NC} ${WHITE}»${NC} Install Engine & Core Tools"
-    echo -e "  ${CYAN}[2]${NC} ${WHITE}»${NC} Update System"
+    echo -e "  ${CYAN}[2]${NC} ${WHITE}»${NC} Update System (Online)"
     echo -e "  ${CYAN}[3]${NC} ${WHITE}»${NC} Uninstall System"
     echo -e "${BLUE} ────────────────────────────────────────────────────────${NC}"
     echo -e "  ${GREEN}[4]${NC} ${WHITE}»${NC} Add Location Node (Single)"
@@ -1508,7 +1770,7 @@ while true; do
 
     case $main_choice in
         1) install_engine ;;
-        2) echo -e "${YELLOW}[!] This feature is currently locked for this tier.${NC}"; sleep 2 ;;
+        2) update_system ;;
         8) change_ip_menu ;;
         3) uninstall_engine ;;
         4) add_single_node ;;
