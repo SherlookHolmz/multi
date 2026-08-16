@@ -25,7 +25,7 @@ MAX_QUALITY_ATTEMPTS=8
 # excluding the bad exit IP and doing a full restart
 MAX_NEWNYM_TRIES=2
 # Maximum total public-IP validation cycles for one node deployment
-MAX_TOTAL_VALIDATION_ATTEMPTS=30
+MAX_TOTAL_VALIDATION_ATTEMPTS=20
 
 # Format: "CountryCode : CountryName : TorPort"
 declare -A NODES=(
@@ -101,12 +101,6 @@ check_root() {
     fi
 }
 
-# Returns via echo: "0" (good) or "1" (bad) followed by "|<actual_cc>"
-# Consults the SAME geolocation source for both the abuse check and the
-# country check, so we are always comparing apples to apples against what
-# Tor's own consensus GeoIP database claims for the exit relay's country.
-# ================= TOR EXIT PREFLIGHT =================
-
 onionoo_exit_count() {
     local code="${1,,}"
     local tmp count
@@ -176,9 +170,28 @@ node_is_installed() {
     local conf_file="$BASE_DIR/node_${code}_${out_port}.conf"
     local ip_file="$DATA_DIR/${code}_${out_port}/last_ip.txt"
 
+    # A node only counts as "installed" if its Tor process is actually
+    # alive right now. Previously this only checked that last_ip.txt had
+    # ever held a valid-looking IP, so a node whose process died (and
+    # whose auto-heal cycle hadn't caught up yet) stayed "ON" forever in
+    # list_locations/add_single_node — blocking reinstall — while
+    # edit_delete_nodes (which filters on pgrep) could no longer see it
+    # to delete it. Requiring a live process here keeps both menus in sync.
     [ -f "$conf_file" ] &&
+    pgrep -f "node_${code}_${out_port}.conf" > /dev/null &&
     [ -s "$ip_file" ] &&
     grep -Eq '^[0-9]+(\.[0-9]+){3}$' "$ip_file"
+}
+
+# True if a node has an install record on disk at all (conf file present),
+# regardless of whether the Tor process is currently alive. Used by the
+# delete menu so dead-but-still-configured nodes can be cleaned up, and by
+# node_has_record() callers that need to distinguish "never installed"
+# from "installed but currently down".
+node_has_record() {
+    local code="$1"
+    local out_port="$2"
+    [ -f "$BASE_DIR/node_${code}_${out_port}.conf" ]
 }
 
 check_ip_quality() {
@@ -230,7 +243,6 @@ check_ip_quality() {
     echo "${bad}|${actual_cc}|${reason}|${seen}"
 }
 
-# Ask the running Tor instance for a brand-new circuit (fast, no restart).
 send_newnym() {
     local control_port="$1" pass="$2"
     (
@@ -241,11 +253,6 @@ send_newnym() {
     ) 2>/dev/null || true
 }
 
-# Rebuilds a node's torrc from scratch, folding in any exit IPs that were
-# previously proven to be geo-mismatched (persisted in bad_exits.txt). This
-# is the actual fix for "every time I get the wrong country I have to wipe
-# the whole project" — the bad relay is permanently excluded going forward
-# instead of being re-rolled at random on every reinstall.
 write_node_conf() {
     local conf_file="$1" out_port="$2" control_port="$3" hashed_pass="$4"
     local inst_data_dir="$5" code="$6"
@@ -275,11 +282,6 @@ Log err file $inst_data_dir/notices.log
 EOF
 }
 
-# ================= BACKGROUND CRON JOB =================
-# Runs every 30 minutes. Unlike the old version, this now also re-validates
-# the exit country for every UP node, not just whether the process is alive.
-# That means country drift self-heals in the background instead of piling
-# up until the user notices and wipes everything.
 background_auto_heal() {
     for idx in "${ORDER[@]}"; do
         local details="${NODES[$idx]}"
@@ -319,7 +321,7 @@ background_auto_heal() {
                         echo "$test_ip" >> "$bad_file"
                         sort -u -o "$bad_file" "$bad_file" 2>/dev/null || true
                     fi
-                    is_dead=1  # force conf rewrite + restart; wrong-country IP is never cached
+                    is_dead=1
                 else
                     echo "$test_ip" > "$ip_file"
                 fi
@@ -399,8 +401,6 @@ deploy_node() {
     local ctrl_file="$inst_data_dir/control.env"
     local bad_file="$inst_data_dir/bad_exits.txt"
 
-    # Do not even create a Tor node when the selected country has no
-    # currently-running Tor Exit relay.
     if ! check_country_exit_availability "$code" "$name"; then
         cleanup_failed_node "$code" "$out_port"
         return 2
@@ -478,9 +478,6 @@ EOF
 
         echo -e "${RED}[-] Rejected $public_ip: ${reason} | detected=${seen_ccs:-unknown} | expected=$code${NC}"
 
-        # Immediately blacklist a bad public address. Tor accepts address
-        # patterns in ExcludeExitNodes, so this prevents the same exit from
-        # being selected again after NEWNYM/restart.
         if ! grep -qxF "$public_ip" "$bad_file" 2>/dev/null; then
             echo "$public_ip" >> "$bad_file"
             sort -u -o "$bad_file" "$bad_file" 2>/dev/null || true
@@ -534,7 +531,6 @@ rotate_one_node() {
     [ -s "$ip_file" ] && old_ip=$(head -n1 "$ip_file" | tr -d '\r\n')
     [ "$silent" = "1" ] || echo -e "${CYAN}🔄 $code - $name: changing IP...${NC}"
 
-    # Fast path: NEWNYM on this node's own Tor instance.
     send_newnym "$CTRL_PORT" "$CTRL_PASS" || true
 
     local attempt new_ip result bad actual reason seen
@@ -558,7 +554,6 @@ rotate_one_node() {
         send_newnym "$CTRL_PORT" "$CTRL_PASS" || true
     done
 
-    # Slow path: rebuild only this Tor instance with the previous exit excluded.
     [ -n "$old_ip" ] && {
         touch "$bad_file"
         grep -qxF "$old_ip" "$bad_file" 2>/dev/null || echo "$old_ip" >> "$bad_file"
@@ -895,7 +890,6 @@ view_active_nodes() {
             local ip_file="$DATA_DIR/${code}_${out_port}/last_ip.txt"
 
             if [ -f "$conf_file" ] && ! node_is_installed "$code" "$out_port"; then
-                # A stale/incomplete deployment must never count as installed.
                 rm -f "$ip_file"
             fi
 
@@ -910,22 +904,38 @@ view_active_nodes() {
                 if pgrep -f "node_${code}_${out_port}.conf" > /dev/null; then
                     printf "${BLUE}│ ${CYAN}%-4s ${BLUE}│ ${WHITE}%-4s ${BLUE}│ ${WHITE}%-20s ${BLUE}│ ${MAGENTA}%-11s ${BLUE}│ ${GREEN}%-12s ${BLUE}│ ${GREEN}%-16s ${BLUE}│${NC}\n" "$idx" "$code" "$name" "$out_port" "ONLINE" "$display_ip"
                 else
-                    rm -f "$ip_file"
-                    sudo -u debian-tor tor -f "$conf_file" >/dev/null 2>&1 &
+                    local heal_lock="$DATA_DIR/${code}_${out_port}/healing.lock"
 
-                    printf "${BLUE}│ ${CYAN}%-4s ${BLUE}│ ${WHITE}%-4s ${BLUE}│ ${WHITE}%-20s ${BLUE}│ ${MAGENTA}%-11s ${BLUE}│ ${YELLOW}%-12s ${BLUE}│ ${YELLOW}%-16s ${BLUE}│${NC}\n" "$idx" "$code" "$name" "$out_port" "HEALING..." "Restarting..."
+                    if [ -f "$heal_lock" ] && kill -0 "$(cat "$heal_lock" 2>/dev/null)" 2>/dev/null; then
+                        # A healer for this node is already running from a
+                        # previous screen refresh — don't stack another one.
+                        printf "${BLUE}│ ${CYAN}%-4s ${BLUE}│ ${WHITE}%-4s ${BLUE}│ ${WHITE}%-20s ${BLUE}│ ${MAGENTA}%-11s ${BLUE}│ ${YELLOW}%-12s ${BLUE}│ ${YELLOW}%-16s ${BLUE}│${NC}\n" "$idx" "$code" "$name" "$out_port" "HEALING..." "Restarting..."
+                    else
+                        rm -f "$ip_file"
+                        sudo -u debian-tor tor -f "$conf_file" >/dev/null 2>&1 &
 
-                    (
-                        while true; do
-                            sleep 8
-                            local new_ip=$(curl -s --socks5-hostname 127.0.0.1:$out_port https://api.ipify.org --connect-timeout 5 --max-time 20 || true)
-                            if [[ "$new_ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-                                echo "$new_ip" > "$ip_file"
-                                break
+                        printf "${BLUE}│ ${CYAN}%-4s ${BLUE}│ ${WHITE}%-4s ${BLUE}│ ${WHITE}%-20s ${BLUE}│ ${MAGENTA}%-11s ${BLUE}│ ${YELLOW}%-12s ${BLUE}│ ${YELLOW}%-16s ${BLUE}│${NC}\n" "$idx" "$code" "$name" "$out_port" "HEALING..." "Restarting..."
+
+                        (
+                            echo $BASHPID > "$heal_lock"
+                            local heal_try=0
+                            local heal_max=15
+                            while [ "$heal_try" -lt "$heal_max" ]; do
+                                sleep 8
+                                local new_ip=$(curl -s --socks5-hostname 127.0.0.1:$out_port https://api.ipify.org --connect-timeout 5 --max-time 20 || true)
+                                if [[ "$new_ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+                                    echo "$new_ip" > "$ip_file"
+                                    break
+                                fi
+                                heal_try=$((heal_try+1))
+                                pkill -HUP -f "node_${code}_${out_port}.conf" 2>/dev/null || true
+                            done
+                            if [ "$heal_try" -ge "$heal_max" ]; then
+                                echo "$(date '+%Y-%m-%d %H:%M:%S') heal failed after $heal_max tries" >> "$DATA_DIR/${code}_${out_port}/heal_fail.log"
                             fi
-                            pkill -HUP -f "node_${code}_${out_port}.conf" 2>/dev/null || true
-                        done
-                    ) &
+                            rm -f "$heal_lock"
+                        ) &
+                    fi
                 fi
             fi
         done
@@ -951,14 +961,18 @@ edit_delete_nodes() {
     local active_nodes=()
     for idx in "${ORDER[@]}"; do
         IFS=':' read -r code name out_port <<< "${NODES[$idx]}"
-        if pgrep -f "node_${code}_${out_port}.conf" > /dev/null; then
+        if node_has_record "$code" "$out_port"; then
             active_nodes+=("$idx")
             local emoji="${EMOJIS[$code]}"
-            printf "  ${CYAN}[%s]${NC} %s %-18s \tTorPort:${MAGENTA}%s${NC}\n" "$idx" "$emoji" "$name" "$out_port"
+            local status_label="${GREEN}RUNNING${NC}"
+            if ! pgrep -f "node_${code}_${out_port}.conf" > /dev/null; then
+                status_label="${RED}DEAD${NC}"
+            fi
+            printf "  ${CYAN}[%s]${NC} %s %-18s \tTorPort:${MAGENTA}%-6s${NC} \t%b\n" "$idx" "$emoji" "$name" "$out_port" "$status_label"
         fi
     done
     if [ ${#active_nodes[@]} -eq 0 ]; then
-        echo -e "  ${RED}No active nodes to delete.${NC}"; sleep 2; return
+        echo -e "  ${RED}No installed nodes to delete.${NC}"; sleep 2; return
     fi
     echo -e "${BLUE}──────────────────────────────────────────────────────────────────${NC}"
     echo -e "  ${RED}[99] DELETE ALL ACTIVE NODES (Clear All)${NC}"
