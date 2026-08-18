@@ -1,332 +1,71 @@
 #!/usr/bin/env bash
-# Sherlook Automate Engine v6.2.2
-# Stable wrapper: keeps the pinned v6.x engine, applies 6.2.2 fixes atomically,
-# and never replaces a working cached engine when the network is unavailable.
+# Sherlook Automate Engine v6.3.0
 set -euo pipefail
-
-VERSION="6.2.2"
+VERSION="6.3.0"
 RAW_URL="https://raw.githubusercontent.com/SherlookHolmz/multi/1f53d18d5cc80ceaf21a093b75fd1133432e5f84/sherlook.sh"
 CACHE_DIR="/var/lib/tor/sherlook_nodes"
 CACHE_FILE="$CACHE_DIR/.sherlook-base.sh"
 PATCHED_FILE="$CACHE_DIR/.sherlook-engine-${VERSION}.sh"
-
 fail(){ printf '[Sherlook %s] ERROR: %s\n' "$VERSION" "$*" >&2; exit 1; }
-
 mkdir -p "$CACHE_DIR"
-
 fetch_base(){
-    local tmp
-    tmp=$(mktemp "${CACHE_DIR}/base.XXXXXX")
-    if curl -4 -fL --retry 10 --retry-all-errors --retry-delay 2         --connect-timeout 8 --max-time 120 -sS -o "$tmp" "$RAW_URL"; then
-        if head -n1 "$tmp" | grep -q '^#!'; then
-            install -m 755 "$tmp" "$CACHE_FILE"
-            rm -f "$tmp"
-            return 0
-        fi
-    fi
-    rm -f "$tmp"
-    [ -s "$CACHE_FILE" ] && return 0
-    fail "unable to obtain Sherlook base engine and no cached engine is available"
+  local tmp; tmp=$(mktemp "${CACHE_DIR}/base.XXXXXX")
+  if curl -4 -fL --retry 8 --retry-all-errors --retry-delay 2 --connect-timeout 8 --max-time 120 -sS -o "$tmp" "$RAW_URL"; then
+    if head -n1 "$tmp" | grep -q '^#!'; then install -m 755 "$tmp" "$CACHE_FILE"; rm -f "$tmp"; return 0; fi
+  fi
+  rm -f "$tmp"; [ -s "$CACHE_FILE" ] && return 0
+  fail "unable to obtain Sherlook base engine and no cached engine is available"
 }
-
-patch_engine(){
+pm_build_patch(){
 python3 - "$CACHE_FILE" "$PATCHED_FILE" <<'PY'
-import re, sys
-src_path, out_path = sys.argv[1:]
-s = open(src_path, encoding="utf-8").read()
-
-s = re.sub(r'^SHERLOOK_VERSION="[^"]+"$', 'SHERLOOK_VERSION="6.2.2"', s, flags=re.M)
-s = re.sub(r'^NODE_ROTATE_RETRIES=\d+$', 'NODE_ROTATE_RETRIES=14', s, flags=re.M)
-s = re.sub(r'^MAX_TOTAL_VALIDATION_ATTEMPTS=\d+$', 'MAX_TOTAL_VALIDATION_ATTEMPTS=32', s, flags=re.M)
-if 'HEAL_REBUILD_AFTER=' not in s:
-    s=s.replace('NODE_ROTATE_RETRIES=14\n',
-                'NODE_ROTATE_RETRIES=14\nHEAL_REBUILD_AFTER=3\nHEAL_IP_FAILURE_LIMIT=2\nHEAL_STATE_TTL=30\nNETWORK_RETRY_LIMIT=6\n',1)
-else:
-    s=re.sub(r'^HEAL_REBUILD_AFTER=\d+$','HEAL_REBUILD_AFTER=3',s,flags=re.M)
-    s=re.sub(r'^HEAL_IP_FAILURE_LIMIT=\d+$','HEAL_IP_FAILURE_LIMIT=2',s,flags=re.M)
-    s=re.sub(r'^HEAL_STATE_TTL=\d+$','HEAL_STATE_TTL=30',s,flags=re.M)
-    if 'NETWORK_RETRY_LIMIT=' not in s:
-        s=s.replace('HEAL_STATE_TTL=30\n','HEAL_STATE_TTL=30\nNETWORK_RETRY_LIMIT=6\n',1)
-
-# Never expand ISO-3166 into candidate locations.
-s = s.replace('\nexpand_iso_locations\n',
-              '\n# 6.2.2: Onionoo running Tor Exits are the only Location source.\n', 1)
-
-old_order = '''    mapfile -t ORDER < <(printf '%s\\n' "${!NODES[@]}" | sort -n)
-}'''
-new_order = '''    # 6.2.2: keep only countries present in the last known-good running Exit cache.
-    if [ -s "$LOCATION_CACHE" ]; then
-        declare -A TOR_EXIT_CC=()
-        while IFS= read -r _cc; do
-            [[ "$_cc" =~ ^[A-Z]{2}$ ]] && TOR_EXIT_CC["$_cc"]=1
-        done < "$LOCATION_CACHE"
-
-        local _key _details _cc _name _port
-        for _key in "${!NODES[@]}"; do
-            _details="${NODES[$_key]}"
-            IFS=':' read -r _cc _name _port <<< "$_details"
-            if [ -z "${TOR_EXIT_CC[$_cc]:-}" ]; then
-                unset 'NODES[$_key]'
-            fi
-        done
-    else
-        NODES=()
-    fi
-
-    mapfile -t ORDER < <(printf '%s\\n' "${!NODES[@]}" | sort -n)
-}'''
-if old_order not in s:
-    raise SystemExit("location order anchor not found")
-s=s.replace(old_order,new_order,1)
-
-old_check = '''    if [ "$count" = "-1" ]; then
-        echo -e "${YELLOW}[!] Onionoo availability check failed for $code.${NC}"
-        echo -e "${YELLOW}[!] Continuing with Tor because the directory service could not be reached.${NC}"
-        return 0
-    fi'''
-new_check = '''    if [ "$count" = "-1" ]; then
-        if [ -s "$LOCATION_CACHE" ] && grep -qx "$code" "$LOCATION_CACHE"; then
-            echo -e "${YELLOW}[!] Onionoo temporarily unavailable; using the last known-good Exit cache for $code.${NC}"
-            return 0
-        fi
-        echo -e "${RED}[-] Cannot verify a Tor Exit for $code while Onionoo is unavailable.${NC}"
-        echo -e "${YELLOW}[!] Install will not proceed with an unverified country.${NC}"
-        return 1
-    fi'''
-if old_check in s:
-    s=s.replace(old_check,new_check,1)
-
-new_send = r'''send_newnym() {
-    local control_port="$1" pass="$2"
-    local response=""
-    response=$(
-        exec 3<>"/dev/tcp/127.0.0.1/${control_port}" 2>/dev/null || exit 2
-        printf 'AUTHENTICATE "%s"
-SIGNAL NEWNYM
-QUIT
-' "$pass" >&3
-        timeout 4 cat <&3 2>/dev/null || true
-        exec 3<&- 3>&-
-    ) || true
-    grep -q '250 OK' <<<"$response"
-}
+import re,sys
+src,out=sys.argv[1:]
+s=open(src,encoding='utf-8').read()
+s=re.sub(r'^SHERLOOK_VERSION="[^"]+"$','SHERLOOK_VERSION="6.3.0"',s,flags=re.M)
+s=re.sub(r'^RAW_INSTALLER_URL=.*$','RAW_INSTALLER_URL="$RAW_BASE/install-sherlook"',s,flags=re.M)
+s=re.sub(r'^LOCATION_CACHE_TTL=\d+$','LOCATION_CACHE_TTL=1800',s,flags=re.M)
+s=re.sub(r'^AUTO_HEAL_INTERVAL=\d+$','AUTO_HEAL_INTERVAL=5',s,flags=re.M)
+s=re.sub(r'^AUTO_HEAL_PARALLEL=\d+$','AUTO_HEAL_PARALLEL=12',s,flags=re.M)
+s=re.sub(r'^NODE_ROTATE_RETRIES=\d+$','NODE_ROTATE_RETRIES=10',s,flags=re.M)
+s=s.replace('A U T O M A T E   E N G I N E   V 6 . 1','A U T O M A T E   E N G I N E   V 6 . 3 . 0')
+pre='if [ "${1:-}" = "--version" ]; then'
+if pre not in s: raise SystemExit('entrypoint anchor missing')
+core=r'''
+# ===== 6.3.0 CANONICAL STATE + TOR EXIT CATALOG =====
+declare -A SHERLOOK_EXIT_AVAILABLE=()
+declare -a LOCATION_ORDER=()
+write_node_state(){ local c="$1" p="$2" st="$3" ip="${4:-}" rs="${5:-}" d="$DATA_DIR/${c}_${p}"; mkdir -p "$d"; printf 'state=%s\nip=%s\nreason=%s\nupdated=%s\n' "$st" "$ip" "$rs" "$(date +%s)" > "$d/state.env"; }
+read_node_state(){ local c="$1" p="$2" f="$DATA_DIR/${c}_${p}/state.env" v=""; [ -s "$f" ] && v=$(awk -F= '$1=="state"{print $2;exit}' "$f" 2>/dev/null || true); [ -n "$v" ] && printf '%s\n' "$v" || { [ -f "$BASE_DIR/node_${c}_${p}.conf" ] && printf 'DEAD\n' || printf 'STOPPED\n'; }; }
+read_node_ip_state(){ local c="$1" p="$2" v=""; v=$(awk -F= '$1=="ip"{print $2;exit}' "$DATA_DIR/${c}_${p}/state.env" 2>/dev/null || true); if is_valid_ipv4 "$v"; then printf '%s\n' "$v"; return 0; fi; v=$(head -n1 "$DATA_DIR/${c}_${p}/last_ip.txt" 2>/dev/null|tr -d '\r\n'||true); is_valid_ipv4 "$v" && printf '%s\n' "$v"; }
+status_for_menu(){ local c="$1" p="$2" st; st=$(read_node_state "$c" "$p"); if [ "$st" = ONLINE ] && ! node_process_running "$c" "$p"; then echo DEAD; else echo "$st"; fi; }
+eval "$(declare -f rotate_one_node_core | sed '1s/^rotate_one_node_core /legacy_rotate_one_node_core /')"
+rotate_one_node_core(){ local c="$1" n="$2" p="$3" s="${4:-0}"; local d="$DATA_DIR/${c}_${p}" ipf="$d/last_ip.txt"; write_node_state "$c" "$p" HEALING "$(read_node_ip_state "$c" "$p"||true)" rotation-start; if [ -f "$BASE_DIR/node_${c}_${p}.conf" ] && ! node_process_running "$c" "$p"; then run_tor_node "$BASE_DIR/node_${c}_${p}.conf"; sleep 3; fi; legacy_rotate_one_node_core "$c" "$n" "$p" "$s"; local rc=$? ip=""; [ -s "$ipf" ]&&ip=$(head -n1 "$ipf"|tr -d '\r\n'); if [ "$rc" = 0 ]&&is_valid_ipv4 "$ip"; then write_node_state "$c" "$p" ONLINE "$ip" verified; else rm -f "$ipf"; write_node_state "$c" "$p" FAILED "" NO_VERIFIED_REPLACEMENT; fi; return $rc; }
+rotate_one_node(){ local c="$1" n="$2" p="$3" s="${4:-0}"; if ! acquire_node_lock "$c" "$p"; then [ "$s" = 1 ]||echo -e "${YELLOW}[!] $c is already being repaired; skipping duplicate rotation.${NC}"; return 3; fi; rotate_one_node_core "$c" "$n" "$p" "$s"; local rc=$?; release_node_lock; return $rc; }
+health_check_node(){ local c="$1" n="$2" p="$3" s="${4:-1}" conf="$BASE_DIR/node_${c}_${p}.conf" d="$DATA_DIR/${c}_${p}"; [ -f "$conf" ]||return 0; if ! acquire_node_lock "$c" "$p"; then return 3; fi; local ip old result bad actual reason seen; old=$(read_node_ip_state "$c" "$p"||true); write_node_state "$c" "$p" HEALING "$old" health-check; if ! node_process_running "$c" "$p"; then release_node_lock; rotate_one_node "$c" "$n" "$p" "$s"; return $?; fi; ip=$(get_node_ip "$p"||true); if ! is_valid_ipv4 "$ip"; then release_node_lock; rotate_one_node "$c" "$n" "$p" "$s"; return $?; fi; result=$(check_ip_quality "$ip" "$c"); IFS='|' read -r bad actual reason seen<<<"$result"; if [ "$bad" = 0 ]; then printf '%s\n' "$ip">"$d/last_ip.txt"; write_node_state "$c" "$p" ONLINE "$ip" verified; release_node_lock; return 0; fi; append_bad_ip "$d/bad_exits.txt" "$ip"; write_node_state "$c" "$p" HEALING "$ip" "$reason"; release_node_lock; rotate_one_node "$c" "$n" "$p" "$s"; }
+background_auto_heal(){ check_root; sync_dynamic_locations; local i c n p; local -a jobs=(); for i in "${ORDER[@]}"; do IFS=':' read -r c n p<<<"${NODES[$i]:-}"; [ -f "$BASE_DIR/node_${c}_${p}.conf" ]||continue; health_check_node "$c" "$n" "$p" 1 & jobs+=("$!"); if [ "${#jobs[@]}" -ge "$AUTO_HEAL_PARALLEL" ]; then wait "${jobs[0]}" 2>/dev/null||true; jobs=("${jobs[@]:1}"); fi; done; for i in "${jobs[@]}"; do wait "$i" 2>/dev/null||true; done; }
+auto_heal_daemon(){ check_root; trap 'exit 0' INT TERM HUP; while true; do background_auto_heal; sleep "$AUTO_HEAL_INTERVAL"; done; }
+sync_dynamic_locations(){ mkdir -p "$DATA_DIR" "$BASE_DIR"; local t=1 tmp code key name port idx base already next=0; local -A old_port=() old_name=() installed=(); local -a avail=() ordered=(); for key in "${!NODES[@]}"; do IFS=':' read -r code name port<<<"${NODES[$key]}"; [ -n "$code" ]||continue; old_port[$code]="$port"; old_name[$code]="$name"; done; if [ -s "$LOCATION_CACHE" ]; then local mt=$(stat -c %Y "$LOCATION_CACHE" 2>/dev/null||echo 0); local now=$(date +%s); (( now-mt<LOCATION_CACHE_TTL ))&&t=0; fi; if ((t)); then tmp=$(mktemp /tmp/sherlook_country.XXXXXX); if curl -4 -fsS --connect-timeout 5 --max-time "$ONIONOO_TIMEOUT" "${ONIONOO_URL}?flag=Exit&running=true&fields=country" -o "$tmp" 2>/dev/null; then jq -r '.relays // [] | .[].country // empty' "$tmp" 2>/dev/null|tr '[:lower:]' '[:upper:]'|grep -E '^[A-Z]{2}$'|sort -u>"${LOCATION_CACHE}.tmp"||true; [ -s "${LOCATION_CACHE}.tmp" ]&&mv -f "${LOCATION_CACHE}.tmp" "$LOCATION_CACHE"; fi; rm -f "$tmp" "${LOCATION_CACHE}.tmp"; fi; SHERLOOK_EXIT_AVAILABLE=(); if [ -s "$LOCATION_CACHE" ]; then while IFS= read -r code; do [[ "$code" =~ ^[A-Z]{2}$ ]]||continue; SHERLOOK_EXIT_AVAILABLE[$code]=1; avail+=("$code"); done<"$LOCATION_CACHE"; fi; for idx in $(printf '%s\n' "${!NODES[@]}"|sort -n); do IFS=':' read -r code name port<<<"${NODES[$idx]}"; [ -n "${SHERLOOK_EXIT_AVAILABLE[$code]:-}" ]||continue; ordered+=("$code"); unset 'SHERLOOK_EXIT_AVAILABLE[$code]'; done; for code in "${avail[@]}"; do [ -n "${SHERLOOK_EXIT_AVAILABLE[$code]:-}" ]||continue; ordered+=("$code"); unset 'SHERLOOK_EXIT_AVAILABLE[$code]'; done; for conf in "$BASE_DIR"/node_??_*.conf "$BASE_DIR"/node_???_*.conf; do [ -f "$conf" ]||continue; base=$(basename "$conf" .conf); base=${base#node_}; code=${base%%_*}; port=${base#*_}; port=${port%%_*}; [[ "$code" =~ ^[A-Z]{2}$ ]]&&installed[$code]="$port"; done; NODES=(); ORDER=(); LOCATION_ORDER=(); for code in "${ordered[@]}"; do next=$((next+1)); port="${old_port[$code]:-${installed[$code]:-9080}}"; name="${old_name[$code]:-$(country_name "$code")}"; key=$(printf '%02d' "$next"); NODES[$key]="$code:$name:$port"; ORDER+=("$key"); LOCATION_ORDER+=("$key"); done; for code in "${!installed[@]}"; do already=0; for key in "${LOCATION_ORDER[@]}"; do IFS=':' read -r c _ _<<<"${NODES[$key]}"; [ "$c" = "$code" ]&& {  already=1;break;}; done; ((already))&&continue; next=$((next+1)); port="${old_port[$code]:-${installed[$code]}}"; name="${old_name[$code]:-$(country_name "$code")}"; key=$(printf '%02d' "$next"); NODES[$key]="$code:$name:$port"; ORDER+=("$key"); done; :>"$LOCATION_CATALOG.tmp"; for key in "${LOCATION_ORDER[@]}"; do IFS=':' read -r code name port<<<"${NODES[$key]}"; printf '%s\t%s\t%s\n' "$code" "$name" "$port">>"$LOCATION_CATALOG.tmp"; done; mv -f "$LOCATION_CATALOG.tmp" "$LOCATION_CATALOG"; }
 '''
-s,n=re.subn(r'send_newnym\(\) \{.*?\n\}\n\nwrite_node_conf\(\)',new_send+'\nwrite_node_conf()',s,flags=re.S)
-if n != 1:
-    raise SystemExit("send_newnym target not found")
-
-state_helper = r'''write_node_state() {
-    local code="$1" port="$2" state="$3" ip="${4:-}" reason="${5:-}"
-    local dir="$DATA_DIR/${code}_${port}"
-    mkdir -p "$dir"
-    {
-        printf 'state=%s
-' "$state"
-        printf 'ip=%s
-' "$ip"
-        printf 'reason=%s
-' "$reason"
-        printf 'updated=%s
-' "$(date +%s)"
-    } > "$dir/state.env"
-}
-
+s=s.replace(pre_marker,core+'\n'+pre_marker,1)
+ui_marker='# ================= MENU LOOP ================='
+if ui_marker not in s: raise SystemExit('menu anchor missing')
+ui=r'''
+# ===== 6.3.0 MANAGEMENT UI =====
+eval "$(declare -f deploy_node | sed '1s/^deploy_node /legacy_deploy_node /')"
+deploy_node(){ local c="$1" n="$2" p="$3"; mkdir -p "$DATA_DIR/${c}_${p}"; write_node_state "$c" "$p" STARTING "" deploy-start; legacy_deploy_node "$c" "$n" "$p"; local rc=$? ip=""; [ -s "$DATA_DIR/${c}_${p}/last_ip.txt" ]&&ip=$(head -n1 "$DATA_DIR/${c}_${p}/last_ip.txt"|tr -d '\r\n'); [ "$rc" = 0 ]&&write_node_state "$c" "$p" ONLINE "$ip" verified || [ -f "$BASE_DIR/node_${c}_${p}.conf" ]&&write_node_state "$c" "$p" FAILED "" deploy-failed; return $rc; }
+node_is_installed(){ local c="$1" p="$2"; [ -f "$BASE_DIR/node_${c}_${p}.conf" ]||return 1; case "$(read_node_state "$c" "$p")" in ONLINE|HEALING|STARTING)return 0;;*)return 1;;esac; }
+list_locations(){ sync_dynamic_locations||true; echo -e "${YELLOW}Available Tor Exit Locations (live Onionoo + cache):${NC}\n"; local total=${#LOCATION_ORDER[@]} half=$(( (total+1)/2 )) i a b ca na pa cb nb pb s1 s2 right; ((total==0))&& {  echo -e "${RED}No verified running Tor Exit countries are currently available.${NC}\n"; return; }; for((i=0;i<half;i++)); do a=${LOCATION_ORDER[$i]}; IFS=':' read -r ca na pa<<<"${NODES[$a]}"; s1=$'\033[1;37m○\033[0m'; node_is_installed "$ca" "$pa"&&s1=$'\033[1;32m●\033[0m'; right=""; if((i+half<total));then b=${LOCATION_ORDER[$((i+half))]}; IFS=':' read -r cb nb pb<<<"${NODES[$b]}"; s2=$'\033[1;37m○\033[0m'; node_is_installed "$cb" "$pb"&&s2=$'\033[1;32m●\033[0m'; right=$(printf '  \033[1;36m[%02d]\033[0m %b %-20s' "$((10#$b))" "$s2" "$nb"); fi; printf '  \033[1;36m[%02d]\033[0m %b %-20s%s\n' "$((10#$a))" "$s1" "$na" "$right"; done; echo -e "\n  ${RED}[00]${NC} Back\n"; }
+add_single_node(){ check_root; draw_header; echo -e "${CYAN}» Option 4 - Add Location Node${NC}\n"; sync_dynamic_locations; list_locations; read -r -p "Select location index: " x; [[ "$x" == 00 || -z "$x" ]]&&return; local k=$(printf '%02d' "$((10#$x))" 2>/dev/null||true); [[ " ${LOCATION_ORDER[*]} " == *" $k "* ]]|| { echo "Invalid location index.";sleep 1;return;}; local c n p; IFS=':' read -r c n p<<<"${NODES[$k]}"; node_is_installed "$c" "$p"&& {  echo -e "${YELLOW}[!] $c - $n is already online/being healed.${NC}";sleep 2;return;}; deploy_node "$c" "$n" "$p"; read -r -p "Press Enter..." < /dev/tty||true; }
+bulk_add_nodes(){ check_root; draw_header; sync_dynamic_locations; echo -e "${CYAN}» Option 5 - Bulk Add Nodes${NC}\n  [1] All current Tor Exits\n  [2] Custom indices\n  [3] Main countries\n  [0] Back\n"; read -r -p "Select: " m; case "$m" in 1) for k in "${LOCATION_ORDER[@]}";do IFS=':' read -r c n p<<<"${NODES[$k]}"; node_is_installed "$c" "$p"||deploy_node "$c" "$n" "$p"; done;; 2) list_locations; read -r -p "Indices (e.g. 1,2,4-6): " list; list=${list// /}; IFS=',' read -ra arr<<<"$list"; for part in "${arr[@]}";do if [[ "$part" =~ ^([0-9]+)-([0-9]+)$ ]];then a=${BASH_REMATCH[1]};b=${BASH_REMATCH[2]};for((x=a;x<=b;x++));do k=$(printf '%02d' "$x");[[ " ${LOCATION_ORDER[*]} " == *" $k "* ]]||continue; IFS=':' read -r c n p<<<"${NODES[$k]}";node_is_installed "$c" "$p"||deploy_node "$c" "$n" "$p";done;elif [[ "$part" =~ ^[0-9]+$ ]];then k=$(printf '%02d' "$part");[[ " ${LOCATION_ORDER[*]} " == *" $k "* ]]||continue;IFS=':' read -r c n p<<<"${NODES[$k]}";node_is_installed "$c" "$p"||deploy_node "$c" "$n" "$p";fi;done;;3) for wanted in TR US FR CA FI ES NL CH GB LU;do for k in "${LOCATION_ORDER[@]}";do IFS=':' read -r c n p<<<"${NODES[$k]}";[ "$c" = "$wanted" ]||continue;node_is_installed "$c" "$p"||deploy_node "$c" "$n" "$p";break;done;done;;*)return;;esac;read -r -p "Press Enter..." < /dev/tty||true; }
+change_ip_menu(){ check_root; while true;do draw_header;sync_dynamic_locations;echo -e "${MAGENTA}🔄 IP Rotation / Repair${NC}\n  [1] One installed Node\n  [2] All installed Nodes\n  [0] Back\n"; local -a ids=();local k c n p ch pick;for k in "${ORDER[@]}";do IFS=':' read -r c n p<<<"${NODES[$k]}";[ -f "$BASE_DIR/node_${c}_${p}.conf" ]||continue;ids+=("$k");done;read -r -p "Choice: " ch< /dev/tty||return;case "$ch" in 1)for k in "${ids[@]}";do IFS=':' read -r c n p<<<"${NODES[$k]}";printf ' [%s] %s %-20s Port:%-6s Status:%-8s IP:%s\n' "$k" "${EMOJIS[$c]:-🌐}" "$n" "$p" "$(status_for_menu "$c" "$p")" "$(read_node_ip_state "$c" "$p"||echo Waiting...)";done;read -r -p "Node ID: " pick< /dev/tty||continue;k=$(printf '%02d' "$((10#$pick))" 2>/dev/null||true);IFS=':' read -r c n p<<<"${NODES[$k]:-:::}";[ -n "$c" ]&&[ -f "$BASE_DIR/node_${c}_${p}.conf" ]&&rotate_one_node "$c" "$n" "$p" 0||echo "Invalid Node ID.";read -r -p "Press Enter..."< /dev/tty||true;;2)for k in "${ids[@]}";do IFS=':' read -r c n p<<<"${NODES[$k]}";rotate_one_node "$c" "$n" "$p" 1&done;wait||true;read -r -p "Press Enter..."< /dev/tty||true;;0)return;;esac;done; }
+view_active_nodes(){ check_root;while true;do draw_header;sync_dynamic_locations;printf '%s\n' '┌──────┬──────┬──────────────────────┬─────────────┬──────────────┬──────────────────┐' '│ ID   │ CC   │ Location             │ Tor Port    │ Status       │ Live IP          │' '├──────┼──────┼──────────────────────┼─────────────┼──────────────┼──────────────────┤';local f=0 k c n p st ip;for k in "${ORDER[@]}";do IFS=':' read -r c n p<<<"${NODES[$k]}";[ -f "$BASE_DIR/node_${c}_${p}.conf" ]||continue;f=1;st=$(status_for_menu "$c" "$p");ip=$(read_node_ip_state "$c" "$p"||echo Waiting...);printf '│ %-4s │ %-4s │ %-20s │ %-11s │ %-12s │ %-16s │\n' "$k" "$c" "$n" "$p" "$st" "$ip";done;[ "$f" = 0 ]&&printf '│ %-80s │\n' 'No installed nodes found.';printf '%s\n' '└──────┴──────┴──────────────────────┴─────────────┴──────────────┴──────────────────┘';echo 'Refresh: 3s; press any key to return.';read -t 3 -n1 -s q&&break;done; }
+edit_delete_nodes(){ check_root;draw_header;sync_dynamic_locations;echo -e "${MAGENTA}[ NODE MANAGEMENT ]${NC}";local -a ids=();local k c n p;for k in "${ORDER[@]}";do IFS=':' read -r c n p<<<"${NODES[$k]}";[ -f "$BASE_DIR/node_${c}_${p}.conf" ]||continue;ids+=("$k");printf ' [%s] %s %-20s Port:%-6s Status:%-8s IP:%s\n' "$k" "${EMOJIS[$c]:-🌐}" "$n" "$p" "$(status_for_menu "$c" "$p")" "$(read_node_ip_state "$c" "$p"||echo Waiting...)";done;[ "${#ids[@]}" = 0 ]&& { echo 'No installed nodes.';sleep 2;return;};echo '[99] DELETE ALL INSTALLED NODE RECORDS';read -r -p 'Select ID (0 cancel): ' x;[[ "$x" = 0 || -z "$x" ]]&&return;if [[ "$x" = 99 ]];then for k in "${ids[@]}";do IFS=':' read -r c n p<<<"${NODES[$k]}";pkill -9 -f "node_${c}_${p}\.conf" 2>/dev/null||true;rm -f "$BASE_DIR/node_${c}_${p}.conf";rm -rf "$DATA_DIR/${c}_${p}";done;else k=$(printf '%02d' "$((10#$x))" 2>/dev/null||true);IFS=':' read -r c n p<<<"${NODES[$k]:-:::}";[ -n "$c" ]&&rm -f "$BASE_DIR/node_${c}_${p}.conf"&&rm -rf "$DATA_DIR/${c}_${p}"||true;fi;sleep 2; }
 '''
-if 'write_node_state() {' not in s:
-    s=s.replace('health_check_node() {',state_helper+'health_check_node() {',1)
-
-health = r'''health_check_node() {
-    local code="$1" name="$2" out_port="$3" silent="${4:-1}"
-    local conf_file="$BASE_DIR/node_${code}_${out_port}.conf"
-    local inst_data_dir="$DATA_DIR/${code}_${out_port}"
-    local ip_file="$inst_data_dir/last_ip.txt"
-    [ -f "$conf_file" ] || return 0
-
-    if ! acquire_node_lock "$code" "$out_port"; then
-        return 3
-    fi
-
-    local current_ip="" old_ip="" result bad actual reason seen
-    [ -s "$ip_file" ] && old_ip=$(head -n1 "$ip_file" | tr -d '
-')
-    write_node_state "$code" "$out_port" "HEALING" "$old_ip" "health-check"
-
-    if ! node_process_running "$code" "$out_port"; then
-        release_node_lock
-        rotate_one_node "$code" "$name" "$out_port" "$silent"
-        return $?
-    fi
-
-    current_ip=$(get_node_ip "$out_port" || true)
-    if ! is_valid_ipv4 "$current_ip"; then
-        release_node_lock
-        rotate_one_node "$code" "$name" "$out_port" "$silent"
-        return $?
-    fi
-
-    result=$(check_ip_quality "$current_ip" "$code")
-    IFS='|' read -r bad actual reason seen <<< "$result"
-
-    if [ "$bad" = "0" ]; then
-        printf '%s
-' "$current_ip" > "$ip_file"
-        write_node_state "$code" "$out_port" "ONLINE" "$current_ip" "verified"
-        release_node_lock
-        return 0
-    fi
-
-    append_bad_ip "$inst_data_dir/bad_exits.txt" "$current_ip"
-    write_node_state "$code" "$out_port" "HEALING" "$current_ip" "$reason"
-    release_node_lock
-    rotate_one_node "$code" "$name" "$out_port" "$silent"
-    return $?
-}
-'''
-s,n=re.subn(r'health_check_node\(\) \{.*?\n\}\n\nbackground_auto_heal\(\)',health+'\nbackground_auto_heal()',s,flags=re.S)
-if n != 1:
-    raise SystemExit("health target not found")
-
-rotate = r'''rotate_one_node_core() {
-    local code="$1" name="$2" out_port="$3" silent="${4:-0}"
-    local conf_file="$BASE_DIR/node_${code}_${out_port}.conf"
-    local inst_data_dir="$DATA_DIR/${code}_${out_port}"
-    local ctrl_file="$inst_data_dir/control.env"
-    local bad_file="$inst_data_dir/bad_exits.txt"
-    local ip_file="$inst_data_dir/last_ip.txt"
-    [ -f "$conf_file" ] && [ -f "$ctrl_file" ] || return 2
-
-    source "$ctrl_file" 2>/dev/null || return 2
-    local old_ip=""
-    [ -s "$ip_file" ] && old_ip=$(head -n1 "$ip_file" | tr -d '
-')
-
-    local attempt=0 new_ip="" result bad actual reason seen
-    local rebuilds=0
-    write_node_state "$code" "$out_port" "HEALING" "$old_ip" "rotation-start"
-    [ "$silent" = "1" ] || echo -e "${CYAN}🔄 $code - $name: changing IP...${NC}"
-
-    for attempt in 1 2 3; do
-        if send_newnym "$CTRL_PORT" "$CTRL_PASS"; then
-            sleep 2
-        else
-            sleep 1
-        fi
-
-        new_ip=$(get_node_ip "$out_port" || true)
-        if ! is_valid_ipv4 "$new_ip"; then
-            continue
-        fi
-        if [ "$new_ip" = "$old_ip" ]; then
-            append_bad_ip "$bad_file" "$new_ip"
-            continue
-        fi
-
-        result=$(check_ip_quality "$new_ip" "$code")
-        IFS='|' read -r bad actual reason seen <<< "$result"
-        if [ "$bad" = "0" ]; then
-            printf '%s
-' "$new_ip" > "$ip_file"
-            write_node_state "$code" "$out_port" "ONLINE" "$new_ip" "verified"
-            [ "$silent" = "1" ] || echo -e "${GREEN}  ✓ $code → $new_ip${NC}"
-            return 0
-        fi
-        append_bad_ip "$bad_file" "$new_ip"
-    done
-
-    if is_valid_ipv4 "$old_ip"; then
-        append_bad_ip "$bad_file" "$old_ip"
-    fi
-
-    for rebuilds in 1 2 3; do
-        write_node_conf "$conf_file" "$out_port" "$CTRL_PORT" "$HASHED_PASS" "$inst_data_dir" "$code"
-        pkill -f "node_${code}_${out_port}\.conf" 2>/dev/null || true
-        sleep 1
-        run_tor_node "$conf_file"
-
-        for attempt in 1 2 3 4; do
-            sleep 2
-            new_ip=$(get_node_ip "$out_port" || true)
-            if ! is_valid_ipv4 "$new_ip"; then
-                continue
-            fi
-            if [ "$new_ip" = "$old_ip" ]; then
-                append_bad_ip "$bad_file" "$new_ip"
-                continue
-            fi
-
-            result=$(check_ip_quality "$new_ip" "$code")
-            IFS='|' read -r bad actual reason seen <<< "$result"
-            if [ "$bad" = "0" ]; then
-                printf '%s
-' "$new_ip" > "$ip_file"
-                write_node_state "$code" "$out_port" "ONLINE" "$new_ip" "verified"
-                [ "$silent" = "1" ] || echo -e "${GREEN}  ✓ $code → $new_ip (rebuild $rebuilds)${NC}"
-                return 0
-            fi
-
-            append_bad_ip "$bad_file" "$new_ip"
-        done
-    done
-
-    rm -f "$ip_file"
-    write_node_state "$code" "$out_port" "FAILED" "" "NO_VERIFIED_IP"
-    echo "$(date '+%Y-%m-%d %H:%M:%S') rotation failed for $code" >> "$inst_data_dir/heal_fail.log"
-    [ "$silent" = "1" ] || echo -e "${RED}  ✗ $code: no verified replacement IP found.${NC}"
-    return 1
-}
-'''
-s,n=re.subn(r'rotate_one_node_core\(\) \{.*?\n\}\n\nrotate_one_node\(\)',rotate+'\nrotate_one_node()',s,flags=re.S)
-if n != 1:
-    raise SystemExit("rotate target not found")
-
-old_net = r'''        if [ -z "$public_ip" ] || ! [[ "$public_ip" =~ ^[0-9]+(\.[0-9]+){3}$ ]]; then
-            connect_attempts=$((connect_attempts+1))
-            total_attempts=$((total_attempts+1))
-            echo -e "${CYAN}[*] Waiting for Tor connection (Attempt $total_attempts/$MAX_TOTAL_VALIDATION_ATTEMPTS)...${NC}"
-            sleep 3
-            continue
-        fi'''
-new_net = r'''        if [ -z "$public_ip" ] || ! [[ "$public_ip" =~ ^[0-9]+(\.[0-9]+){3}$ ]]; then
-            if ! curl -4 -fsS --connect-timeout 3 --max-time 5 https://api.ipify.org -o /dev/null 2>/dev/null; then
-                echo -e "${YELLOW}[!] Upstream network is unavailable; keeping the partial install intact and retrying...${NC}"
-                sleep 5
-                continue
-            fi
-            connect_attempts=$((connect_attempts+1))
-            total_attempts=$((total_attempts+1))
-            echo -e "${CYAN}[*] Waiting for Tor connection (Attempt $total_attempts/$MAX_TOTAL_VALIDATION_ATTEMPTS)...${NC}"
-            sleep 2
-            continue
-        fi'''
-if old_net in s:
-    s=s.replace(old_net,new_net,1)
-
-s=s.replace('Available Tor Exit Locations (dynamic + built-in):',
-            'Available Tor Exit Locations (Tor Exit-only):')
-s=s.replace('A U T O M A T E   E N G I N E   V 6 . 1',
-            'A U T O M A T E   E N G I N E   V 6 . 2 . 2')
-
-old_status='''            if node_process_running "$code" "$out_port"; then status="ONLINE"; else status="HEALING"; fi'''
-new_status='''            status="HEALING"
-            state_file="$DATA_DIR/${code}_${out_port}/state.env"
-            if [ -s "$state_file" ]; then
-                state_value=$(awk -F= '$1=="state"{print $2; exit}' "$state_file" 2>/dev/null || true)
-                state_ip=$(awk -F= '$1=="ip"{print $2; exit}' "$state_file" 2>/dev/null || true)
-                if [ "$state_value" = "ONLINE" ] && is_valid_ipv4 "$state_ip"; then
-                    status="ONLINE"
-                    display_ip="$state_ip"
-                elif [ "$state_value" = "FAILED" ]; then
-                    status="FAILED"
-                fi
-            fi'''
-if old_status in s:
-    s=s.replace(old_status,new_status,1)
-
-open(out_path,'w',encoding='utf-8').write(s)
+s=s.replace(ui_marker,ui+'\n'+ui_marker,1)
+open(out,'w',encoding='utf-8').write(s)
 PY
 chmod 755 "$PATCHED_FILE"
 }
-
 fetch_base
-patch_engine
+pm_build_patch
 exec bash "$PATCHED_FILE" "$@"
