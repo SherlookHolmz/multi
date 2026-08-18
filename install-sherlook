@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
-# Sherlook 6.2.1 installer
+# Sherlook 6.2.2 installer
 set -euo pipefail
 
 RED='\033[1;31m'; GREEN='\033[1;32m'; CYAN='\033[1;36m'; NC='\033[0m'
 RAW_WRAPPER_URL="https://raw.githubusercontent.com/SherlookHolmz/multi/main/sherlook.sh"
 WRAPPER_URL="${SHERLOOK_WRAPPER_URL:-$RAW_WRAPPER_URL}"
 INSTALL_PATH="/usr/local/bin/sherlook"
-TMP="$(mktemp /tmp/sherlook-6.2.1.XXXXXX.sh)"
+TMP="$(mktemp /tmp/sherlook-6.2.2.XXXXXX.sh)"
 trap 'rm -f "$TMP"' EXIT
 
 if [ "${EUID:-$(id -u)}" -ne 0 ]; then
@@ -14,7 +14,7 @@ if [ "${EUID:-$(id -u)}" -ne 0 ]; then
   exit 1
 fi
 
-echo -e "${CYAN}[*] Fetching Sherlook 6.2.1 engine wrapper...${NC}"
+echo -e "${CYAN}[*] Fetching Sherlook 6.2.2 engine wrapper...${NC}"
 curl -4 -fL --retry 5 --retry-delay 1 --connect-timeout 10 --max-time 60 -sS -o "$TMP" "$WRAPPER_URL"
 
 head -n1 "$TMP" | grep -q '^#!'
@@ -32,5 +32,5 @@ if systemctl list-unit-files 2>/dev/null | grep -q '^sherlook-heal\.service'; th
   systemctl restart sherlook-heal.service 2>/dev/null || true
 fi
 
-echo -e "${GREEN}[+] Sherlook 6.2.1 installed.${NC}"
-echo -e "${GREEN}[+] Health recovery: 20 bounded attempts, IP re-validation, bad-exit exclusion and persistent state.${NC}"
+echo -e "${GREEN}[+] Sherlook 6.2.2 installed.${NC}"
+echo -e "${GREEN}[+] Health recovery: 20 bounded attempts, IP re-validation, bad-exit exclusion, persistent state, and Tor-exit-only country filtering.${NC}"
