@@ -1,32 +1,36 @@
 #!/usr/bin/env bash
-# Sherlook Automate Engine (Nexatis Edition) - Auto Installer
+# Sherlook 6.2.1 installer
+set -euo pipefail
 
-RED='\033[1;31m'
-GREEN='\033[1;32m'
-CYAN='\033[1;36m'
-NC='\033[0m'
+RED='\033[1;31m'; GREEN='\033[1;32m'; CYAN='\033[1;36m'; NC='\033[0m'
+RAW_WRAPPER_URL="https://raw.githubusercontent.com/SherlookHolmz/multi/main/sherlook.sh"
+WRAPPER_URL="${SHERLOOK_WRAPPER_URL:-$RAW_WRAPPER_URL}"
+INSTALL_PATH="/usr/local/bin/sherlook"
+TMP="$(mktemp /tmp/sherlook-6.2.1.XXXXXX.sh)"
+trap 'rm -f "$TMP"' EXIT
 
-if [ "$EUID" -ne 0 ]; then
-    echo -e "${RED}[!] Error: Please run as root (sudo).${NC}"
-    exit 1
+if [ "${EUID:-$(id -u)}" -ne 0 ]; then
+  echo -e "${RED}[!] Please run as root.${NC}" >&2
+  exit 1
 fi
 
-echo -e "${CYAN}[*] Fetching the latest Sherlook Engine...${NC}"
-RAW_URL="https://raw.githubusercontent.com/SherlookHolmz/multi/main/sherlook.sh"
+echo -e "${CYAN}[*] Fetching Sherlook 6.2.1 engine wrapper...${NC}"
+curl -4 -fL --retry 5 --retry-delay 1 --connect-timeout 10 --max-time 60 -sS -o "$TMP" "$WRAPPER_URL"
 
-# Download the script to a temporary location
-curl -4 -fL --connect-timeout 10 --max-time 30 -o /tmp/sherlook.sh "$RAW_URL"
+head -n1 "$TMP" | grep -q '^#!'
+bash -n "$TMP"
+install -m 755 "$TMP" "$INSTALL_PATH"
+install -d -m 755 /root/.sherlook
+install -m 755 "$TMP" /root/.sherlook/sherlook.sh
 
-if [ $? -ne 0 ]; then
-    echo -e "${RED}[!] Failed to download the engine from GitHub.${NC}"
-    exit 1
+# Start once so the wrapper materializes the patched engine and the upstream
+# installer/service remain compatible with the existing v6.x layout.
+"$INSTALL_PATH" --install
+
+if systemctl list-unit-files 2>/dev/null | grep -q '^sherlook-heal\.service'; then
+  systemctl daemon-reload 2>/dev/null || true
+  systemctl restart sherlook-heal.service 2>/dev/null || true
 fi
 
-chmod +x /tmp/sherlook.sh
-echo -e "${GREEN}[+] Download successful. Starting automated installation...${NC}"
-
-# Execute the engine with the silent install flag
-/tmp/sherlook.sh --install
-
-# Clean up
-rm -f /tmp/sherlook.sh
+echo -e "${GREEN}[+] Sherlook 6.2.1 installed.${NC}"
+echo -e "${GREEN}[+] Health recovery: 20 bounded attempts, IP re-validation, bad-exit exclusion and persistent state.${NC}"
