@@ -1,38 +1,110 @@
 #!/usr/bin/env bash
-# Sherlook installer — fetches sherlook.sh (if not already local) and runs
-# its built-in installer (apt deps, systemd auto-heal service, etc).
+# ==============================================================================
+#  Sherlook Installation & Deployment Engine
+#  Version: 6.4.0
+# ==============================================================================
+
 set -euo pipefail
 
-RAW_URL="https://raw.githubusercontent.com/SherlookHolmz/multi/main/sherlook.sh"
-INSTALL_PATH="/usr/local/bin/sherlook"
+VERSION="6.4.0"
+INSTALL_DIR="/usr/local/bin"
+SHERLOOK_BIN="${INSTALL_DIR}/sherlook"
+RAW_BASE_URL="https://raw.githubusercontent.com/SherlookHolmz/sherlook/main"
 
-if [ "$EUID" -ne 0 ]; then
-    echo "[!] Please run as root (sudo bash install.sh)" >&2
-    exit 1
+echo "=================================================================="
+echo "          Installing Sherlook Tor Proxy Manager v${VERSION}       "
+echo "=================================================================="
+
+# Root Check
+if [[ $EUID -ne 0 ]]; then
+   echo "[!] This script must be run as root. Try: sudo $0"
+   exit 1
 fi
 
-SRC=""
-if [ -f "$(dirname "$0")/sherlook.sh" ]; then
-    SRC="$(dirname "$0")/sherlook.sh"
-    echo "[*] Using local sherlook.sh next to this installer..."
-else
-    echo "[*] No local sherlook.sh found next to this installer — downloading from GitHub..."
-    TMP=$(mktemp /tmp/sherlook_dl.XXXXXX)
-    if ! curl -4 -fL --retry 5 --retry-delay 1 --connect-timeout 10 --max-time 60 -o "$TMP" "$RAW_URL"; then
-        echo "[!] Download failed and no local sherlook.sh is present. Aborting." >&2
-        rm -f "$TMP"
+# Package Manager Detection & Dependency Installation
+install_dependencies() {
+    echo "[+] Checking system dependencies..."
+    local deps=("tor" "curl" "jq" "nc" "flock")
+    local missing=()
+
+    for dep in "${deps[@]}"; do
+        if ! command -v "$dep" >/dev/null 2>&1; then
+            missing+=("$dep")
+        fi
+    done
+
+    if [[ ${#missing[@]} -eq 0 ]]; then
+        echo "[✓] All dependencies met."
+        return 0
+    fi
+
+    echo "[+] Installing missing packages: ${missing[*]}..."
+
+    if command -v apt-get >/dev/null 2>&1; then
+        apt-get update -qq
+        apt-get install -y -qq tor curl jq netcat-openbsd util-linux
+    elif command -v dnf >/dev/null 2>&1; then
+        dnf install -y -q tor curl jq nc util-linux
+    elif command -v yum >/dev/null 2>&1; then
+        yum install -y -q tor curl jq nc util-linux
+    elif command -v pacman >/dev/null 2>&1; then
+        pacman -Sy --noconfirm tor curl jq gnu-netcat util-linux
+    else
+        echo "[!] Unsupported package manager. Please install missing packages manually."
+    fi
+}
+
+# Deploy Sherlook Binary
+deploy_binary() {
+    echo "[+] Fetching latest Sherlook binary (v${VERSION})..."
+    local tmp_script="/tmp/sherlook_install.sh"
+
+    if curl -s -f -L "${RAW_BASE_URL}/sherlook.sh" -o "$tmp_script"; then
+        if bash -n "$tmp_script"; then
+            mv -f "$tmp_script" "$SHERLOOK_BIN"
+            chmod +x "$SHERLOOK_BIN"
+            echo "[✓] Installed binary to ${SHERLOOK_BIN}"
+        else
+            echo "[!] Syntax check failed for downloaded binary. Installation aborted."
+            rm -f "$tmp_script"
+            exit 1
+        fi
+    else
+        echo "[!] Failed to download sherlook.sh from repository."
         exit 1
     fi
-    SRC="$TMP"
-fi
+}
 
-head -n1 "$SRC" | grep -q '^#!' || { echo "[!] Downloaded file doesn't look like a shell script. Aborting." >&2; exit 1; }
-bash -n "$SRC" || { echo "[!] sherlook.sh failed a syntax check. Aborting." >&2; exit 1; }
+# Setup Systemd Service (Optional Auto-Heal Daemon)
+setup_systemd() {
+    echo "[+] Setting up systemd service for Auto-Heal Daemon..."
+    cat <<EOF > /etc/systemd/system/sherlook-daemon.service
+[Unit]
+Description=Sherlook Tor Auto-Heal Daemon
+After=network.target
 
-install -m 755 "$SRC" "$INSTALL_PATH"
-echo "[+] Installed engine to $INSTALL_PATH"
-echo "[*] Running built-in installer (apt packages + systemd auto-heal service)..."
-"$INSTALL_PATH" --install
+[Service]
+Type=simple
+ExecStart=${SHERLOOK_BIN} --daemon
+Restart=always
+RestartSec=10
+User=root
 
-echo ""
-echo "[+] Done. Run 'sherlook' any time to open the menu."
+[Install]
+WantedBy=multi-user.target
+EOF
+
+    systemctl daemon-reload || true
+    systemctl enable sherlook-daemon.service || true
+    echo "[✓] Systemd service 'sherlook-daemon' configured."
+}
+
+# Execution Flow
+install_dependencies
+deploy_binary
+setup_systemd
+
+echo "=================================================================="
+echo " [✓] Sherlook v${VERSION} Installation Complete!"
+echo " Run 'sherlook' in your terminal to start the management CLI."
+echo "=================================================================="
