@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
-# Sherlook 6.3.4 installer
+# Sherlook 6.3.3 installer
 set -euo pipefail
 RED='\033[1;31m'; GREEN='\033[1;32m'; YELLOW='\033[1;33m'; NC='\033[0m'
 RAW_WRAPPER_URL="https://raw.githubusercontent.com/SherlookHolmz/multi/main/sherlook.sh"
 INSTALL_PATH="/usr/local/bin/sherlook"
 STATE_DIR="/var/lib/tor/sherlook_nodes"
 CACHE="$STATE_DIR/.installer-wrapper.sh"
-TMP="$(mktemp /tmp/sherlook-6.3.4.XXXXXX.sh)"
+TMP="$(mktemp /tmp/sherlook-6.3.3.XXXXXX.sh)"
 trap 'rm -f "$TMP"' EXIT
 
 if [ "${EUID:-$(id -u)}" -ne 0 ]; then
@@ -32,7 +32,7 @@ fi
 
 head -n1 "$TMP" | grep -q '^#!'
 bash -n "$TMP"
-grep -q 'VERSION="6.3.4"' "$TMP" || { echo -e "${RED}[!] Wrong wrapper version; refusing install.${NC}" >&2; exit 1; }
+grep -q 'VERSION="6.3.3"' "$TMP" || { echo -e "${RED}[!] Wrong wrapper version; refusing install.${NC}" >&2; exit 1; }
 install -m 755 "$TMP" "$INSTALL_PATH"
 install -m 755 "$TMP" "$CACHE"
 install -d -m 755 /root/.sherlook
@@ -40,5 +40,5 @@ install -m 755 "$TMP" /root/.sherlook/sherlook.sh
 
 "$INSTALL_PATH" --install
 
-echo -e "${GREEN}[+] Sherlook 6.3.4 installed.${NC}"
-echo -e "${GREEN}[+] Offline Tor-Exit-only catalog (~80 countries), compact numbering, and auto-heal are enabled.${NC}"
+echo -e "${GREEN}[+] Sherlook 6.3.3 installed.${NC}"
+echo -e "${GREEN}[+] Canonical node states, Tor-Exit-only locations, compact numbering, and auto-heal are enabled.${NC}"
