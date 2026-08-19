@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# Sherlook Automate Engine v6.3.2
+# Sherlook Automate Engine v6.3.3
 set -euo pipefail
-VERSION="6.3.2"
+VERSION="6.3.3"
 RAW_URL="https://raw.githubusercontent.com/SherlookHolmz/multi/1f53d18d5cc80ceaf21a093b75fd1133432e5f84/sherlook.sh"
 CACHE_DIR="/var/lib/tor/sherlook_nodes"
 CACHE_FILE="$CACHE_DIR/.sherlook-base.sh"
@@ -21,7 +21,7 @@ python3 - "$CACHE_FILE" "$PATCHED_FILE" <<'PY'
 import re,sys
 src,out=sys.argv[1:]
 s=open(src,encoding='utf-8').read()
-s=re.sub(r'^SHERLOOK_VERSION="[^"]+"$','SHERLOOK_VERSION="6.3.2"',s,flags=re.M)
+s=re.sub(r'^SHERLOOK_VERSION="[^"]+"$','SHERLOOK_VERSION="6.3.3"',s,flags=re.M)
 s=re.sub(r'^RAW_INSTALLER_URL=.*$','RAW_INSTALLER_URL="$RAW_BASE/install-sherlook"',s,flags=re.M)
 s=re.sub(r'^LOCATION_CACHE_TTL=\d+$','LOCATION_CACHE_TTL=1800',s,flags=re.M)
 s=re.sub(r'^AUTO_HEAL_INTERVAL=\d+$','AUTO_HEAL_INTERVAL=5',s,flags=re.M)
@@ -37,7 +37,7 @@ pre_marker = 'if [ "${1:-}" = "--version" ]; then'
 if pre_marker not in s: raise SystemExit('entrypoint anchor missing')
 
 core=r'''
-# ===== 6.3.2 CANONICAL STATE + TOR EXIT CATALOG =====
+# ===== 6.3.3 CANONICAL STATE + TOR EXIT CATALOG =====
 declare -A SHERLOOK_EXIT_AVAILABLE=()
 declare -a LOCATION_ORDER=()
 write_node_state(){ local c="$1" p="$2" st="$3" ip="${4:-}" rs="${5:-}" d="$DATA_DIR/${c}_${p}"; mkdir -p "$d"; printf 'state=%s\nip=%s\nreason=%s\nupdated=%s\n' "$st" "$ip" "$rs" "$(date +%s)" > "$d/state.env"; }
@@ -114,7 +114,7 @@ s=s.replace(pre_marker,core+'\n'+pre_marker,1)
 ui_marker='# ================= MENU LOOP ================='
 if ui_marker not in s: raise SystemExit('menu anchor missing')
 ui=r'''
-# ===== 6.3.2 MANAGEMENT UI =====
+# ===== 6.3.3 MANAGEMENT UI =====
 eval "$(declare -f deploy_node | sed '1s/^deploy_node /legacy_deploy_node /')"
 deploy_node(){ local c="$1" n="$2" p="$3"; mkdir -p "$DATA_DIR/${c}_${p}"; write_node_state "$c" "$p" STARTING "" deploy-start; legacy_deploy_node "$c" "$n" "$p"; local rc=$? ip=""; [ -s "$DATA_DIR/${c}_${p}/last_ip.txt" ]&&ip=$(head -n1 "$DATA_DIR/${c}_${p}/last_ip.txt"|tr -d '\r\n'); [ "$rc" = 0 ]&&write_node_state "$c" "$p" ONLINE "$ip" verified || [ -f "$BASE_DIR/node_${c}_${p}.conf" ]&&write_node_state "$c" "$p" FAILED "" deploy-failed; return $rc; }
 node_is_installed(){ local c="$1" p="$2"; [ -f "$BASE_DIR/node_${c}_${p}.conf" ]||return 1; case "$(read_node_state "$c" "$p")" in ONLINE|HEALING|STARTING)return 0;;*)return 1;;esac; }
@@ -122,7 +122,7 @@ list_locations(){ sync_dynamic_locations||true; echo -e "${YELLOW}Available Tor 
 add_single_node(){ check_root; draw_header; echo -e "${CYAN}» Option 4 - Add Location Node${NC}\n"; sync_dynamic_locations; list_locations; read -r -p "Select location index: " x; [[ "$x" == 00 || -z "$x" ]]&&return; local k=$(printf '%02d' "$((10#$x))" 2>/dev/null||true); [[ " ${LOCATION_ORDER[*]} " == *" $k "* ]]|| { echo "Invalid location index.";sleep 1;return;}; local c n p; IFS=':' read -r c n p<<<"${NODES[$k]}"; node_is_installed "$c" "$p"&& {  echo -e "${YELLOW}[!] $c - $n is already online/being healed.${NC}";sleep 2;return;}; deploy_node "$c" "$n" "$p"; read -r -p "Press Enter..." < /dev/tty||true; }
 bulk_add_nodes(){ check_root; draw_header; sync_dynamic_locations; echo -e "${CYAN}» Option 5 - Bulk Add Nodes${NC}\n  [1] All current Tor Exits\n  [2] Custom indices\n  [3] Main countries\n  [0] Back\n"; read -r -p "Select: " m; case "$m" in 1) for k in "${LOCATION_ORDER[@]}";do IFS=':' read -r c n p<<<"${NODES[$k]}"; node_is_installed "$c" "$p"||deploy_node "$c" "$n" "$p"; done;; 2) list_locations; read -r -p "Indices (e.g. 1,2,4-6): " list; list=${list// /}; IFS=',' read -ra arr<<<"$list"; for part in "${arr[@]}";do if [[ "$part" =~ ^([0-9]+)-([0-9]+)$ ]];then a=${BASH_REMATCH[1]};b=${BASH_REMATCH[2]};for((x=a;x<=b;x++));do k=$(printf '%02d' "$x");[[ " ${LOCATION_ORDER[*]} " == *" $k "* ]]||continue; IFS=':' read -r c n p<<<"${NODES[$k]}";node_is_installed "$c" "$p"||deploy_node "$c" "$n" "$p";done;elif [[ "$part" =~ ^[0-9]+$ ]];then k=$(printf '%02d' "$part");[[ " ${LOCATION_ORDER[*]} " == *" $k "* ]]||continue;IFS=':' read -r c n p<<<"${NODES[$k]}";node_is_installed "$c" "$p"||deploy_node "$c" "$n" "$p";fi;done;;3) for wanted in TR US FR CA FI ES NL CH GB LU;do for k in "${LOCATION_ORDER[@]}";do IFS=':' read -r c n p<<<"${NODES[$k]}";[ "$c" = "$wanted" ]||continue;node_is_installed "$c" "$p"||deploy_node "$c" "$n" "$p";break;done;done;;*)return;;esac;read -r -p "Press Enter..." < /dev/tty||true; }
 change_ip_menu(){ check_root; while true;do draw_header;sync_dynamic_locations;echo -e "${MAGENTA}🔄 IP Rotation / Repair${NC}\n  [1] One installed Node\n  [2] All installed Nodes\n  [0] Back\n"; local -a ids=();local k c n p ch pick;for k in "${ORDER[@]}";do IFS=':' read -r c n p<<<"${NODES[$k]}";[ -f "$BASE_DIR/node_${c}_${p}.conf" ]||continue;ids+=("$k");done;read -r -p "Choice: " ch< /dev/tty||return;case "$ch" in 1)for k in "${ids[@]}";do IFS=':' read -r c n p<<<"${NODES[$k]}";printf ' [%s] %s %-20s Port:%-6s Status:%-8s IP:%s\n' "$k" "${EMOJIS[$c]:-🌐}" "$n" "$p" "$(status_for_menu "$c" "$p")" "$(read_node_ip_state "$c" "$p"||echo Waiting...)";done;read -r -p "Node ID: " pick< /dev/tty||continue;k=$(printf '%02d' "$((10#$pick))" 2>/dev/null||true);IFS=':' read -r c n p<<<"${NODES[$k]:-:::}";[ -n "$c" ]&&[ -f "$BASE_DIR/node_${c}_${p}.conf" ]&&rotate_one_node "$c" "$n" "$p" 0||echo "Invalid Node ID.";read -r -p "Press Enter..."< /dev/tty||true;;2)for k in "${ids[@]}";do IFS=':' read -r c n p<<<"${NODES[$k]}";rotate_one_node "$c" "$n" "$p" 1&done;wait||true;read -r -p "Press Enter..."< /dev/tty||true;;0)return;;esac;done; }
-view_active_nodes(){ check_root;while true;do draw_header;sync_dynamic_locations;printf '%s\n' '┌──────┬──────┬──────────────────────┬─────────────┬──────────────┬──────────────────┐' '│ ID   │ CC   │ Location             │ Tor Port    │ Status       │ Live IP          │' '├──────┼──────┼──────────────────────┼─────────────┼──────────────┼──────────────────┤';local f=0 k c n p st ip;for k in "${ORDER[@]}";do IFS=':' read -r c n p<<<"${NODES[$k]}";[ -f "$BASE_DIR/node_${c}_${p}.conf" ]||continue;f=1;st=$(status_for_menu "$c" "$p");ip=$(read_node_ip_state "$c" "$p"||echo Waiting...);printf '│ %-4s │ %-4s │ %-20s │ %-11s │ %-12s │ %-16s │\n' "$k" "$c" "$n" "$p" "$st" "$ip";done;[ "$f" = 0 ]&&printf '│ %-80s │\n' 'No installed nodes found.';printf '%s\n' '└──────┴──────┴──────────────────────┴─────────────┴──────────────────┘';echo 'Refresh: 3s; press any key to return.';read -t 3 -n1 -s q&&break;done; }
+view_active_nodes(){ check_root;while true;do draw_header;sync_dynamic_locations;printf '%s\n' '┌──────┬──────┬──────────────────────┬─────────────┬──────────────┬──────────────────┐' '│ ID   │ CC   │ Location             │ Tor Port    │ Status       │ Live IP          │' '├──────┼──────┼──────────────────────┼─────────────┼──────────────┼──────────────────┤';local f=0 k c n p st ip;for k in "${ORDER[@]}";do IFS=':' read -r c n p<<<"${NODES[$k]}";[ -f "$BASE_DIR/node_${c}_${p}.conf" ]||continue;f=1;st=$(status_for_menu "$c" "$p");ip=$(read_node_ip_state "$c" "$p"||echo Waiting...);printf '│ %-4s │ %-4s │ %-20s │ %-11s │ %-12s │ %-16s │\n' "$k" "$c" "$n" "$p" "$st" "$ip";done;[ "$f" = 0 ]&&printf '│ %-80s │\n' 'No installed nodes found.';printf '%s\n' '└──────┴──────┴──────────────────────┴─────────────┴──────────────┴──────────────────┘';echo 'Refresh: 3s; press any key to return.';read -t 3 -n1 -s q&&break;done; }
 edit_delete_nodes(){ check_root;draw_header;sync_dynamic_locations;echo -e "${MAGENTA}[ NODE MANAGEMENT ]${NC}";local -a ids=();local k c n p;for k in "${ORDER[@]}";do IFS=':' read -r c n p<<<"${NODES[$k]}";[ -f "$BASE_DIR/node_${c}_${p}.conf" ]||continue;ids+=("$k");printf ' [%s] %s %-20s Port:%-6s Status:%-8s IP:%s\n' "$k" "${EMOJIS[$c]:-🌐}" "$n" "$p" "$(status_for_menu "$c" "$p")" "$(read_node_ip_state "$c" "$p"||echo Waiting...)";done;[ "${#ids[@]}" = 0 ]&& { echo 'No installed nodes.';sleep 2;return;};echo '[99] DELETE ALL INSTALLED NODE RECORDS';read -r -p 'Select ID (0 cancel): ' x;[[ "$x" = 0 || -z "$x" ]]&&return;if [[ "$x" = 99 ]];then for k in "${ids[@]}";do IFS=':' read -r c n p<<<"${NODES[$k]}";pkill -9 -f "node_${c}_${p}\.conf" 2>/dev/null||true;rm -f "$BASE_DIR/node_${c}_${p}.conf";rm -rf "$DATA_DIR/${c}_${p}";done;else k=$(printf '%02d' "$((10#$x))" 2>/dev/null||true);IFS=':' read -r c n p<<<"${NODES[$k]:-:::}";[ -n "$c" ]&&rm -f "$BASE_DIR/node_${c}_${p}.conf"&&rm -rf "$DATA_DIR/${c}_${p}"||true;fi;sleep 2; }
 '''
 s=s.replace(ui_marker,ui+'\n'+ui_marker,1)
