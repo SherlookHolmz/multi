@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# Sherlook Automate Engine v6.3.1
+# Sherlook Automate Engine v6.3.2
 set -euo pipefail
-VERSION="6.3.1"
+VERSION="6.3.2"
 RAW_URL="https://raw.githubusercontent.com/SherlookHolmz/multi/1f53d18d5cc80ceaf21a093b75fd1133432e5f84/sherlook.sh"
 CACHE_DIR="/var/lib/tor/sherlook_nodes"
 CACHE_FILE="$CACHE_DIR/.sherlook-base.sh"
@@ -21,13 +21,13 @@ python3 - "$CACHE_FILE" "$PATCHED_FILE" <<'PY'
 import re,sys
 src,out=sys.argv[1:]
 s=open(src,encoding='utf-8').read()
-s=re.sub(r'^SHERLOOK_VERSION="[^"]+"$','SHERLOOK_VERSION="6.3.1"',s,flags=re.M)
+s=re.sub(r'^SHERLOOK_VERSION="[^"]+"$','SHERLOOK_VERSION="6.3.2"',s,flags=re.M)
 s=re.sub(r'^RAW_INSTALLER_URL=.*$','RAW_INSTALLER_URL="$RAW_BASE/install-sherlook"',s,flags=re.M)
 s=re.sub(r'^LOCATION_CACHE_TTL=\d+$','LOCATION_CACHE_TTL=1800',s,flags=re.M)
 s=re.sub(r'^AUTO_HEAL_INTERVAL=\d+$','AUTO_HEAL_INTERVAL=5',s,flags=re.M)
 s=re.sub(r'^AUTO_HEAL_PARALLEL=\d+$','AUTO_HEAL_PARALLEL=12',s,flags=re.M)
 s=re.sub(r'^NODE_ROTATE_RETRIES=\d+$','NODE_ROTATE_RETRIES=10',s,flags=re.M)
-s=s.replace('A U T O M A T E   E N G I N E   V 6 . 1','A U T O M A T E   E N G I N E   V 6 . 3 . 1')
+s=s.replace('A U T O M A T E   E N G I N E   V 6 . 1','A U T O M A T E   E N G I N E   V 6 . 3 . 2')
 
 # --- FIX #1 (crash): the anchor variable used below must be the one that was
 # actually assigned above. The old patch built `pre` but then referenced the
@@ -37,7 +37,7 @@ pre_marker = 'if [ "${1:-}" = "--version" ]; then'
 if pre_marker not in s: raise SystemExit('entrypoint anchor missing')
 
 core=r'''
-# ===== 6.3.1 CANONICAL STATE + TOR EXIT CATALOG =====
+# ===== 6.3.2 CANONICAL STATE + TOR EXIT CATALOG =====
 declare -A SHERLOOK_EXIT_AVAILABLE=()
 declare -a LOCATION_ORDER=()
 write_node_state(){ local c="$1" p="$2" st="$3" ip="${4:-}" rs="${5:-}" d="$DATA_DIR/${c}_${p}"; mkdir -p "$d"; printf 'state=%s\nip=%s\nreason=%s\nupdated=%s\n' "$st" "$ip" "$rs" "$(date +%s)" > "$d/state.env"; }
@@ -54,9 +54,57 @@ status_for_menu(){ local c="$1" p="$2" st; st=$(read_node_state "$c" "$p"); if [
 eval "$(declare -f rotate_one_node_core | sed '1s/^rotate_one_node_core /legacy_rotate_one_node_core /')"
 rotate_one_node_core(){ local c="$1" n="$2" p="$3" s="${4:-0}"; local d="$DATA_DIR/${c}_${p}" ipf="$d/last_ip.txt"; write_node_state "$c" "$p" HEALING "$(read_node_ip_state "$c" "$p"||true)" rotation-start; if [ -f "$BASE_DIR/node_${c}_${p}.conf" ] && ! node_process_running "$c" "$p"; then run_tor_node "$BASE_DIR/node_${c}_${p}.conf"; sleep 3; fi; legacy_rotate_one_node_core "$c" "$n" "$p" "$s"; local rc=$? ip=""; [ -s "$ipf" ]&&ip=$(head -n1 "$ipf"|tr -d '\r\n'); if [ "$rc" = 0 ]&&is_valid_ipv4 "$ip"; then write_node_state "$c" "$p" ONLINE "$ip" verified; else rm -f "$ipf"; write_node_state "$c" "$p" FAILED "" NO_VERIFIED_REPLACEMENT; fi; return $rc; }
 rotate_one_node(){ local c="$1" n="$2" p="$3" s="${4:-0}"; if ! acquire_node_lock "$c" "$p"; then [ "$s" = 1 ]||echo -e "${YELLOW}[!] $c is already being repaired; skipping duplicate rotation.${NC}"; return 3; fi; rotate_one_node_core "$c" "$n" "$p" "$s"; local rc=$?; release_node_lock; return $rc; }
-health_check_node(){ local c="$1" n="$2" p="$3" s="${4:-1}" conf="$BASE_DIR/node_${c}_${p}.conf" d="$DATA_DIR/${c}_${p}"; [ -f "$conf" ]||return 0; if ! acquire_node_lock "$c" "$p"; then return 3; fi; local ip old result bad actual reason seen; old=$(read_node_ip_state "$c" "$p"||true); write_node_state "$c" "$p" HEALING "$old" health-check; if ! node_process_running "$c" "$p"; then release_node_lock; rotate_one_node "$c" "$n" "$p" "$s"; return $?; fi; ip=$(get_node_ip "$p"||true); if ! is_valid_ipv4 "$ip"; then release_node_lock; rotate_one_node "$c" "$n" "$p" "$s"; return $?; fi; result=$(check_ip_quality "$ip" "$c"); IFS='|' read -r bad actual reason seen<<<"$result"; if [ "$bad" = 0 ]; then printf '%s\n' "$ip">"$d/last_ip.txt"; write_node_state "$c" "$p" ONLINE "$ip" verified; release_node_lock; return 0; fi; append_bad_ip "$d/bad_exits.txt" "$ip"; write_node_state "$c" "$p" HEALING "$ip" "$reason"; release_node_lock; rotate_one_node "$c" "$n" "$p" "$s"; }
+health_check_node(){ local c="$1" n="$2" p="$3" s="${4:-1}" conf="$BASE_DIR/node_${c}_${p}.conf" d="$DATA_DIR/${c}_${p}"; [ -f "$conf" ]||return 0; if ! acquire_node_lock "$c" "$p"; then return 3; fi; local ip old result bad actual reason seen; old=$(read_node_ip_state "$c" "$p"||true); write_node_state "$c" "$p" HEALING "$old" health-check; if ! node_process_running "$c" "$p"; then release_node_lock; rotate_one_node "$c" "$n" "$p" "$s"; return $?; fi; ip=$(get_node_ip "$p"||true); if ! is_valid_ipv4 "$ip"; then release_node_lock; rotate_one_node "$c" "$n" "$p" "$s"; return $?; fi; result=$(check_ip_quality "$ip" "$c" "$p"); IFS='|' read -r bad actual reason seen<<<"$result"; if [ "$bad" = 0 ]; then printf '%s\n' "$ip">"$d/last_ip.txt"; write_node_state "$c" "$p" ONLINE "$ip" verified; release_node_lock; return 0; fi; append_bad_ip "$d/bad_exits.txt" "$ip"; write_node_state "$c" "$p" HEALING "$ip" "$reason"; release_node_lock; rotate_one_node "$c" "$n" "$p" "$s"; }
 background_auto_heal(){ check_root; sync_dynamic_locations; local i c n p; local -a jobs=(); for i in "${ORDER[@]}"; do IFS=':' read -r c n p<<<"${NODES[$i]:-}"; [ -f "$BASE_DIR/node_${c}_${p}.conf" ]||continue; health_check_node "$c" "$n" "$p" 1 & jobs+=("$!"); if [ "${#jobs[@]}" -ge "$AUTO_HEAL_PARALLEL" ]; then wait "${jobs[0]}" 2>/dev/null||true; jobs=("${jobs[@]:1}"); fi; done; for i in "${jobs[@]}"; do wait "$i" 2>/dev/null||true; done; }
 auto_heal_daemon(){ check_root; trap 'exit 0' INT TERM HUP; while true; do background_auto_heal; sleep "$AUTO_HEAL_INTERVAL"; done; }
+# FIX #4 (real root cause of "verified exits stuck HEALING/FAILED forever"):
+# check_ip_quality() queried 3 external GeoIP APIs over the HOST's normal
+# (non-Tor) network with a tight 3s/6s timeout, and treated "all 3
+# unreachable" the same as "confirmed bad" (bad=1). On a host whose direct
+# route to those APIs is slow, rate-limited, or blocked, that made every
+# single exit fail corroboration -- even though Tor's own
+# `ExitNodes {CC}` + `StrictNodes 1` already guarantees the exit's country,
+# and the exit itself works fine (proven by curling api.ipify.org straight
+# through the node's own SOCKS port). This override: (a) gives direct calls
+# more time and two retry rounds instead of failing on one bad attempt, (b)
+# when a port is supplied, checks THROUGH that node's own Tor circuit
+# instead of the host's possibly-blocked direct path, and (c) most
+# importantly, no longer treats "couldn't reach any GeoIP API" as a reject --
+# it now only rejects on a confirmed country MISMATCH or confirmed high-risk
+# score, and trusts Tor's own consensus-enforced country otherwise.
+check_ip_quality(){
+  local ip="$1" expected_cc="${2^^}" port="${3:-}"
+  local tmpdir; tmpdir=$(mktemp -d /tmp/sherlook_geo.XXXXXX) || { echo "0||GEOIP_UNAVAILABLE_TRUSTING_TOR_CONSENSUS|"; return; }
+  local -a curl_base=(curl -4 -sS --connect-timeout 6 --max-time 15)
+  [ -n "$port" ] && curl_base+=(--socks5-hostname "127.0.0.1:${port}")
+  local api1="" api2="" api3="" cc1="" cc2="" cc3="" round
+  for round in 1 2; do
+    "${curl_base[@]}" "https://api.ipapi.is/?q=$ip" >"$tmpdir/a" 2>/dev/null & local p1=$!
+    "${curl_base[@]}" "https://ipwho.is/$ip" >"$tmpdir/b" 2>/dev/null & local p2=$!
+    "${curl_base[@]}" "https://ipapi.co/$ip/json/" >"$tmpdir/c" 2>/dev/null & local p3=$!
+    wait "$p1" "$p2" "$p3" 2>/dev/null || true
+    api1=$(cat "$tmpdir/a" 2>/dev/null||true); api2=$(cat "$tmpdir/b" 2>/dev/null||true); api3=$(cat "$tmpdir/c" 2>/dev/null||true)
+    cc1=$(echo "$api1"|jq -r '.location.country_code // .country_code // empty' 2>/dev/null|tr '[:lower:]' '[:upper:]')
+    cc2=$(echo "$api2"|jq -r '.country_code // .countryCode // empty' 2>/dev/null|tr '[:lower:]' '[:upper:]')
+    cc3=$(echo "$api3"|jq -r '.country_code // empty' 2>/dev/null|tr '[:lower:]' '[:upper:]')
+    [ -n "$cc1$cc2$cc3" ] && break
+    sleep 2
+  done
+  local verified=0 mismatch=0 high_risk=0
+  for cc in "$cc1" "$cc2" "$cc3"; do [ -n "$cc" ] && { verified=1; [ "$cc" != "$expected_cc" ] && mismatch=1; }; done
+  echo "$api1" | grep -iq '"abuser_score".*"High"' && high_risk=1
+  local bad=0 reason=""
+  if [ "$verified" -eq 0 ]; then bad=0; reason="GEOIP_UNAVAILABLE_TRUSTING_TOR_CONSENSUS"
+  elif [ "$mismatch" -eq 1 ]; then bad=1; reason="COUNTRY_MISMATCH"
+  elif [ "$high_risk" -eq 1 ]; then bad=1; reason="HIGH_RISK"
+  else reason="VERIFIED"; fi
+  local actual_cc=""
+  if [ -n "$cc1" ]; then actual_cc="$cc1"; elif [ -n "$cc2" ]; then actual_cc="$cc2"; elif [ -n "$cc3" ]; then actual_cc="$cc3"; fi
+  local seen=""
+  for cc in "$cc1" "$cc2" "$cc3"; do [ -z "$cc" ] && continue; [ -z "$seen" ] && seen="$cc" || seen="$seen,$cc"; done
+  rm -rf "$tmpdir"
+  echo "${bad}|${actual_cc}|${reason}|${seen}"
+}
 # FIX #3 (blank rows): name resolution now always falls back to the country
 # code itself if country_name() can't resolve a label, so a location can
 # never render as a bare marker with no text next to it.
@@ -66,7 +114,7 @@ s=s.replace(pre_marker,core+'\n'+pre_marker,1)
 ui_marker='# ================= MENU LOOP ================='
 if ui_marker not in s: raise SystemExit('menu anchor missing')
 ui=r'''
-# ===== 6.3.1 MANAGEMENT UI =====
+# ===== 6.3.2 MANAGEMENT UI =====
 eval "$(declare -f deploy_node | sed '1s/^deploy_node /legacy_deploy_node /')"
 deploy_node(){ local c="$1" n="$2" p="$3"; mkdir -p "$DATA_DIR/${c}_${p}"; write_node_state "$c" "$p" STARTING "" deploy-start; legacy_deploy_node "$c" "$n" "$p"; local rc=$? ip=""; [ -s "$DATA_DIR/${c}_${p}/last_ip.txt" ]&&ip=$(head -n1 "$DATA_DIR/${c}_${p}/last_ip.txt"|tr -d '\r\n'); [ "$rc" = 0 ]&&write_node_state "$c" "$p" ONLINE "$ip" verified || [ -f "$BASE_DIR/node_${c}_${p}.conf" ]&&write_node_state "$c" "$p" FAILED "" deploy-failed; return $rc; }
 node_is_installed(){ local c="$1" p="$2"; [ -f "$BASE_DIR/node_${c}_${p}.conf" ]||return 1; case "$(read_node_state "$c" "$p")" in ONLINE|HEALING|STARTING)return 0;;*)return 1;;esac; }
