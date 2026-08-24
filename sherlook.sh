@@ -20,7 +20,7 @@ INSTALL_PATH="/usr/local/bin/sherlook"
 RAW_BASE="https://raw.githubusercontent.com/SherlookHolmz/multi/main"
 RAW_ENGINE_URL="$RAW_BASE/sherlook.sh"
 RAW_INSTALLER_URL="$RAW_BASE/install.sh"
-SHERLOOK_VERSION="6.2.2"
+SHERLOOK_VERSION="6.2.3"
 LOCATION_CACHE="$DATA_DIR/onionoo_exit_countries.cache"
 LOCATION_CATALOG="$DATA_DIR/location_catalog.tsv"
 LOCATION_CACHE_TTL=21600
@@ -43,6 +43,8 @@ MAX_TOTAL_VALIDATION_ATTEMPTS=20
 COUNTRY_FALLBACK_THRESHOLD=5
 FALLBACK_AUTO_ON_NONINTERACTIVE=1
 FALLBACK_ROUTE_ATTEMPTS=5
+# After N consecutive wrong-country IPs, ask whether to keep trying or skip to fallback.
+COUNTRY_FAILURE_PROMPT_ENABLED=1
 
 
 # Format: "CountryCode : CountryName : TorPort"
@@ -308,6 +310,39 @@ validate_node_ip() {
     result=$(check_ip_quality "$ip" "$expected")
     IFS='|' read -r bad actual reason seen <<< "$result"
     printf '%s|%s|%s|%s\n' "$bad" "$actual" "$reason" "$seen"
+}
+
+# Hide exact rejected IPs in the UI/log and show only their /16 range.
+# The full IP is still stored internally in bad_exits.txt for exclusion.
+ip_display_range() {
+    local ip="$1"
+    if is_valid_ipv4 "$ip"; then
+        local a b c d
+        IFS='.' read -r a b c d <<< "$ip"
+        printf '%s.%s.0.0/16' "$a" "$b"
+    else
+        printf 'unknown'
+    fi
+}
+
+prompt_country_failure_action() {
+    local code="$1" name="$2" failed="$3"
+    # Return codes: 0=continue same country, 2=auto fallback, 3=stop node.
+    echo -e "\n${YELLOW}[!] ${EMOJIS[$code]} $name has reached $failed wrong-country IPs.${NC}"
+    echo -e "  ${CYAN}[1]${NC} Keep trying ${WHITE}$name${NC}"
+    echo -e "  ${CYAN}[2]${NC} Skip ${WHITE}$name${NC} and move to fallback countries automatically"
+    echo -e "  ${RED}[3]${NC} Skip/stop this node"
+    local action='2'
+    if [ "$COUNTRY_FAILURE_PROMPT_ENABLED" = "1" ] && [ -t 0 ] && [ -t 1 ]; then
+        read -r -p "Choice [1-3]: " action < /dev/tty || action=2
+    elif [ "$FALLBACK_AUTO_ON_NONINTERACTIVE" = "1" ]; then
+        action=2
+    fi
+    case "$action" in
+        1) return 0 ;;
+        3) return 3 ;;
+        *) return 2 ;;
+    esac
 }
 
 
@@ -800,8 +835,42 @@ EOF
                 fi
 
                 country_failures=$((country_failures+1))
-                echo -e "${RED}[-] Rejected $public_ip: ${reason} | detected=${seen_ccs:-unknown} | expected=$route_code${NC}"
+                local display_ip
+                display_ip=$(ip_display_range "$public_ip")
+                echo -e "${RED}[-] Rejected IP range ${display_ip}: ${reason} | detected=${seen_ccs:-unknown} | expected=${route_code}${NC}"
                 append_bad_ip "$bad_file" "$public_ip"
+
+                # IMPORTANT: when the primary country produces 5 wrong-country IPs,
+                # do not wait for attempts 6..20. Ask immediately whether to keep
+                # trying, skip to automatic fallback, or stop the node.
+                if [ "$fallback_mode" -eq 0 ] && [ "$country_failures" -ge "$COUNTRY_FALLBACK_THRESHOLD" ]; then
+                    if prompt_country_failure_action "$code" "$name" "$country_failures"; then
+                        echo -e "${CYAN}[*] Continuing with ${name}; mismatch counter reset.${NC}"
+                        country_failures=0
+                    else
+                        case "$?" in
+                            3)
+                                cleanup_failed_node "$code" "$out_port"
+                                return 1
+                                ;;
+                            *)
+                                fallback_mode=1
+                                fallback_index=0
+                                # Stop the current primary-country Tor process before
+                                # selecting the first fallback route. No more IP checks
+                                # are performed for the primary route in this cycle.
+                                pkill -f "node_${code}_${out_port}\.conf" 2>/dev/null || true
+                                sleep 1
+                                break
+                                ;;
+                        esac
+                    fi
+                fi
+            fi
+
+            if [ "$fallback_mode" -eq 1 ]; then
+                # Primary-country loop was interrupted by the 5-failure skip action.
+                break
             fi
 
             if [ "$total_attempts" -lt "$attempt_limit" ]; then
@@ -827,14 +896,16 @@ EOF
             fi
         done
 
-        # Requested country failed all 20 real attempts: ask once which strategy to use.
+        # If the 5-wrong-IP action already switched to fallback, do NOT ask the
+        # old 20-attempt question again. Go directly to the fallback selector.
         if [ "$fallback_mode" -eq 0 ]; then
+            # Requested country exhausted its full 20-attempt budget.
             local fb_choice=2
             if [ -t 0 ] && [ -t 1 ]; then
                 echo -e "\n${YELLOW}[!] ${name} failed to produce a verified ${code} IP after ${MAX_TOTAL_VALIDATION_ATTEMPTS} attempts.${NC}"
                 echo -e "  ${CYAN}[1]${NC} Try ${code} again (new 20-attempt cycle)"
-                echo -e "  ${CYAN}[2]${NC} Move to fallback countries automatically (5 attempts each)"
-                echo -e "  ${RED}[3]${NC} Stop this node"
+                echo -e "  ${CYAN}[2]${NC} Skip ${name} and move to fallback countries automatically (5 attempts each)"
+                echo -e "  ${RED}[3]${NC} Skip/stop this node"
                 read -r -p "Choice [1-3]: " fb_choice < /dev/tty || fb_choice=2
             fi
 
@@ -854,8 +925,7 @@ EOF
             fallback_mode=1
             fallback_index=0
         else
-            # Every fallback route gets exactly 5 attempts. Then move automatically
-            # to the next candidate instead of validating the same route again.
+            # Every fallback route gets exactly 5 attempts, then advances.
             fallback_index=$((fallback_index+1))
         fi
 
@@ -948,7 +1018,9 @@ rotate_one_node_core() {
                     return 0
                 fi
                 append_bad_ip "$bad_file" "$new_ip"
-                [ "$silent" = "1" ] || echo -e "${RED}  ✗ $code rejected $new_ip for route $expected_route: $reason (attempt $attempt/$NODE_ROTATE_RETRIES)${NC}"
+                local display_new_ip
+                display_new_ip=$(ip_display_range "$new_ip")
+                [ "$silent" = "1" ] || echo -e "${RED}  ✗ $code rejected IP range $display_new_ip for route $expected_route: $reason (attempt $attempt/$NODE_ROTATE_RETRIES)${NC}"
                 same_ip_count=0
             fi
         else
