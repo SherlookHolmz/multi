@@ -20,7 +20,7 @@ INSTALL_PATH="/usr/local/bin/sherlook"
 RAW_BASE="https://raw.githubusercontent.com/SherlookHolmz/multi/main"
 RAW_ENGINE_URL="$RAW_BASE/sherlook.sh"
 RAW_INSTALLER_URL="$RAW_BASE/install.sh"
-SHERLOOK_VERSION="6.2.1"
+SHERLOOK_VERSION="6.2.2"
 LOCATION_CACHE="$DATA_DIR/onionoo_exit_countries.cache"
 LOCATION_CATALOG="$DATA_DIR/location_catalog.tsv"
 LOCATION_CACHE_TTL=21600
@@ -42,6 +42,7 @@ MAX_TOTAL_VALIDATION_ATTEMPTS=20
 # After this many country-specific failures, offer a fallback route while keeping the node label.
 COUNTRY_FALLBACK_THRESHOLD=5
 FALLBACK_AUTO_ON_NONINTERACTIVE=1
+FALLBACK_ROUTE_ATTEMPTS=5
 
 
 # Format: "CountryCode : CountryName : TorPort"
@@ -555,7 +556,7 @@ ControlPort 127.0.0.1:$control_port
 HashedControlPassword $hashed_pass
 DataDirectory $inst_data_dir
 GeoIPExcludeUnknown 1
-ExitNodes {$code}
+ExitNodes {$route_code}
 StrictNodes 1
 $exclude_line
 RunAsDaemon 1
@@ -731,9 +732,21 @@ EOF
         chmod 600 "$ctrl_file"
     fi
 
-    local country_round=0
+    # Primary country gets the full 20-attempt budget. Each fallback route gets
+    # its own independent 5-attempt budget. Fallback IPs are NOT required to
+    # geolocate to the route country; the original node label is preserved.
+    local fallback_mode=0
+    local fallback_index=0
+    local fallback_candidates_arr=()
+    mapfile -t fallback_candidates_arr < <(fallback_candidates "$code")
+
     while true; do
         local route_code="$(node_route_code "$code" "$out_port")"
+        local attempt_limit="$MAX_TOTAL_VALIDATION_ATTEMPTS"
+        if [ "$fallback_mode" -eq 1 ]; then
+            attempt_limit="$FALLBACK_ROUTE_ATTEMPTS"
+        fi
+
         write_node_conf "$conf_file" "$out_port" "$control_port" "$hashed_pass" "$inst_data_dir" "$code"
         chown debian-tor:debian-tor "$conf_file" 2>/dev/null || true
 
@@ -742,26 +755,38 @@ EOF
             sleep 2
         fi
 
-        echo -e "${CYAN}[*] Routing ${WHITE}$code - $name ${CYAN}➔ ExitNodes ${MAGENTA}$route_code${CYAN}, Tor Port: ${MAGENTA}$out_port${CYAN}.${NC}"
+        if [ "$fallback_mode" -eq 1 ]; then
+            echo -e "${YELLOW}[!] ${EMOJIS[$code]} $name keeps its original label; fallback route is ${WHITE}$route_code${YELLOW}. IP country is NOT required to match ${route_code}.${NC}"
+            echo -e "${CYAN}[*] Routing ${WHITE}$code - $name ${CYAN}➔ ExitNodes ${MAGENTA}$route_code${CYAN}, Port: ${MAGENTA}$out_port${CYAN}.${NC}"
+        else
+            echo -e "${CYAN}[*] Routing ${WHITE}$code - $name ${CYAN}➔ ExitNodes ${MAGENTA}$route_code${CYAN}, Port: ${MAGENTA}$out_port${CYAN}.${NC}"
+        fi
+
         run_tor_node "$conf_file"
-        echo -e "${CYAN}[*] Tor started. Beginning public-IP validation immediately (Attempt 1/${MAX_TOTAL_VALIDATION_ATTEMPTS}).${NC}"
+        echo -e "${CYAN}[*] Tor started. Validation begins at Attempt 1/${attempt_limit}.${NC}"
 
         local total_attempts=0
         local newnym_tries=0
         local last_ip=""
         local country_failures=0
-        local switched_route=0
 
-        while [ "$total_attempts" -lt "$MAX_TOTAL_VALIDATION_ATTEMPTS" ]; do
+        while [ "$total_attempts" -lt "$attempt_limit" ]; do
             total_attempts=$((total_attempts+1))
             local public_ip
             public_ip=$(curl -4 -sS --socks5-hostname 127.0.0.1:"$out_port" https://api.ipify.org --connect-timeout 5 --max-time 12 2>/dev/null | tr -d '\0\r\n' || true)
 
             if [ -z "$public_ip" ] || ! is_valid_ipv4 "$public_ip"; then
-                echo -e "${CYAN}[*] Waiting for Tor connection (Attempt $total_attempts/$MAX_TOTAL_VALIDATION_ATTEMPTS)...${NC}"
-                sleep 3
+                echo -e "${CYAN}[*] Waiting for Tor connection (Attempt $total_attempts/$attempt_limit)...${NC}"
+            elif [ "$fallback_mode" -eq 1 ]; then
+                # IMPORTANT: fallback routes are intentionally label-independent.
+                # Do not reject a valid public IP because GeoIP says CH/US/etc.
+                echo -e "${CYAN}[*] Fallback route ${MAGENTA}$route_code${CYAN}: accepting public IP ${WHITE}$public_ip${CYAN} without country-match rejection.${NC}"
+                printf '%s\n' "$public_ip" > "$ip_file"
+                echo -e "${GREEN}[+] FALLBACK VERIFIED: $public_ip → label=$code/$name route=$route_code${NC}"
+                echo -e "${GREEN}[+] Online -> ${WHITE}$code - $name ${GREEN}($public_ip)${NC}\n"
+                return 0
             else
-                echo -e "${CYAN}[*] Verifying ${MAGENTA}$public_ip${CYAN} against multiple GeoIP sources for ${WHITE}$route_code${CYAN}...${NC}"
+                echo -e "${CYAN}[*] Verifying ${MAGENTA}$public_ip${CYAN} against GeoIP sources for ${WHITE}$route_code${CYAN}...${NC}"
                 local result is_bad actual_cc reason seen_ccs
                 result=$(validate_node_ip "$public_ip" "$route_code")
                 IFS='|' read -r is_bad actual_cc reason seen_ccs <<< "$result"
@@ -777,64 +802,83 @@ EOF
                 country_failures=$((country_failures+1))
                 echo -e "${RED}[-] Rejected $public_ip: ${reason} | detected=${seen_ccs:-unknown} | expected=$route_code${NC}"
                 append_bad_ip "$bad_file" "$public_ip"
+            fi
 
-                if [ "$country_failures" -ge "$COUNTRY_FALLBACK_THRESHOLD" ] && [ "$route_code" = "$code" ]; then
-                    if fallback_or_retry_deploy "$code" "$name" "$out_port" 1; then
-                        route_code="$(node_route_code "$code" "$out_port")"
-                        switched_route=1
-                        echo -e "${YELLOW}[*] Switching $name to fallback route ${WHITE}$route_code${YELLOW}; IP label remains ${WHITE}$name${YELLOW}. Restarting validation from Attempt 1.${NC}"
-                        break
-                    else
-                        case "$?" in
-                            2)
-                                echo -e "${YELLOW}[*] Continuing with the requested country $code.${NC}"
-                                country_failures=0
-                                ;;
-                            3)
-                                cleanup_failed_node "$code" "$out_port"
-                                return 1
-                                ;;
-                            *) ;;
-                        esac
-                    fi
-                fi
-
+            if [ "$total_attempts" -lt "$attempt_limit" ]; then
                 if [ "$public_ip" = "$last_ip" ]; then
                     newnym_tries=$MAX_NEWNYM_TRIES
                 fi
                 last_ip="$public_ip"
+
                 if [ "$newnym_tries" -lt "$MAX_NEWNYM_TRIES" ]; then
                     echo -e "${CYAN}    > Requesting a new circuit (NEWNYM)...${NC}"
                     send_newnym "$control_port" "$ctrl_pass"
                     newnym_tries=$((newnym_tries+1))
                     sleep 6
                 else
-                    echo -e "${YELLOW}    > Same/bad exit detected. Rebuilding Tor with this IP excluded...${NC}"
+                    echo -e "${YELLOW}    > Rebuilding Tor with known-bad IPs excluded...${NC}"
                     write_node_conf "$conf_file" "$out_port" "$control_port" "$hashed_pass" "$inst_data_dir" "$code"
                     pkill -f "node_${code}_${out_port}\.conf" 2>/dev/null || true
                     sleep 2
                     run_tor_node "$conf_file"
-                    sleep 4
+                    sleep 3
                     newnym_tries=0
                 fi
             fi
         done
 
-        if [ "$switched_route" -eq 1 ]; then
+        # Requested country failed all 20 real attempts: ask once which strategy to use.
+        if [ "$fallback_mode" -eq 0 ]; then
+            local fb_choice=2
+            if [ -t 0 ] && [ -t 1 ]; then
+                echo -e "\n${YELLOW}[!] ${name} failed to produce a verified ${code} IP after ${MAX_TOTAL_VALIDATION_ATTEMPTS} attempts.${NC}"
+                echo -e "  ${CYAN}[1]${NC} Try ${code} again (new 20-attempt cycle)"
+                echo -e "  ${CYAN}[2]${NC} Move to fallback countries automatically (5 attempts each)"
+                echo -e "  ${RED}[3]${NC} Stop this node"
+                read -r -p "Choice [1-3]: " fb_choice < /dev/tty || fb_choice=2
+            fi
+
+            case "$fb_choice" in
+                1)
+                    echo -e "${YELLOW}[*] Retrying ${name} with its original country ${code}.${NC}"
+                    continue
+                    ;;
+                3)
+                    cleanup_failed_node "$code" "$out_port"
+                    return 1
+                    ;;
+                *)
+                    ;;
+            esac
+
+            fallback_mode=1
+            fallback_index=0
+        else
+            # Every fallback route gets exactly 5 attempts. Then move automatically
+            # to the next candidate instead of validating the same route again.
+            fallback_index=$((fallback_index+1))
+        fi
+
+        local next_route=""
+        while [ "$fallback_index" -lt "${#fallback_candidates_arr[@]}" ]; do
+            next_route="${fallback_candidates_arr[$fallback_index]}"
+            fallback_index=$((fallback_index+1))
+            local count
+            count=$(onionoo_exit_count "${next_route,,}")
+            if [ "$count" = "-1" ] || [ "$count" -ge "$ONIONOO_MIN_EXITS" ] 2>/dev/null; then
+                break
+            fi
+            next_route=""
+        done
+
+        if [ -n "$next_route" ]; then
+            set_node_route_code "$code" "$out_port" "$next_route"
+            echo -e "${YELLOW}[!] ${name}: route ${WHITE}${route_code}${YELLOW} failed after ${attempt_limit} attempts. Moving automatically to next fallback route ${WHITE}${next_route}${YELLOW}; label remains ${WHITE}${name}${YELLOW}.${NC}"
             continue
         fi
 
-        # If the requested country exhausted all 20 attempts, offer the fallback once more.
-        if [ "$route_code" = "$code" ]; then
-            if fallback_or_retry_deploy "$code" "$name" "$out_port" 1; then
-                echo -e "${YELLOW}[*] Fallback route selected. Restarting from Attempt 1 with route ${WHITE}$(node_route_code "$code" "$out_port")${YELLOW}.${NC}"
-                continue
-            fi
-        fi
-
         cleanup_failed_node "$code" "$out_port"
-        echo -e "${RED}[-] FAILED: No verified ${route_code} exit IP was available after $MAX_TOTAL_VALIDATION_ATTEMPTS attempts.${NC}"
-        echo -e "${YELLOW}[!] The node was NOT marked online and no unverified/wrong-country IP was accepted.${NC}\n"
+        echo -e "${RED}[-] FAILED: No usable fallback route remained for ${name}.${NC}"
         return 1
     done
 }
