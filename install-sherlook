@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Sherlook Engine Installer Script
+# Sherlook Engine Installer Script v6.2.0
 
 RED='\033[1;31m'
 GREEN='\033[1;32m'
@@ -57,9 +57,10 @@ main() {
     local tmp_script
     tmp_script=$(mktemp /tmp/sherlook_install.XXXXXX) || exit 1
 
-    if [ -f "./sherlook.sh" ]; then
-        echo -e "${GREEN}[+] Local sherlook.sh found. Using local file...${NC}"
-        cp "./sherlook.sh" "$tmp_script"
+    local installer_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    if [ -f "$installer_dir/sherlook.sh" ]; then
+        echo -e "${GREEN}[+] Local sherlook.sh found beside installer. Using local file...${NC}"
+        cp "$installer_dir/sherlook.sh" "$tmp_script"
     else
         echo -e "${CYAN}[*] Downloading latest Sherlook Engine from Github...${NC}"
         if ! curl -4 -fL --retry 3 --connect-timeout 10 --max-time 60 -o "$tmp_script" "$RAW_ENGINE_URL"; then
