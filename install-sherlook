@@ -12,6 +12,7 @@ NC='\033[0m'
 
 RAW_BASE="https://raw.githubusercontent.com/SherlookHolmz/multi/main"
 RAW_ENGINE_URL="$RAW_BASE/sherlook.sh"
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 INSTALL_PATH="/usr/local/bin/sherlook"
 BASE_DIR="/etc/tor/sherlook_nodes"
 DATA_DIR="/var/lib/tor/sherlook_nodes"
@@ -61,6 +62,9 @@ main() {
     if [ -f "$installer_dir/sherlook.sh" ]; then
         echo -e "${GREEN}[+] Local sherlook.sh found beside installer. Using local file...${NC}"
         cp "$installer_dir/sherlook.sh" "$tmp_script"
+    elif [ -f "$installer_dir/sherlook-v6.2.1.sh" ]; then
+        echo -e "${GREEN}[+] Local sherlook-v6.2.1.sh found beside installer. Using local file...${NC}"
+        cp "$installer_dir/sherlook-v6.2.1.sh" "$tmp_script"
     else
         echo -e "${CYAN}[*] Downloading latest Sherlook Engine from Github...${NC}"
         if ! curl -4 -fL --retry 3 --connect-timeout 10 --max-time 60 -o "$tmp_script" "$RAW_ENGINE_URL"; then
