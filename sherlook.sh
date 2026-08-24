@@ -20,13 +20,13 @@ INSTALL_PATH="/usr/local/bin/sherlook"
 RAW_BASE="https://raw.githubusercontent.com/SherlookHolmz/multi/main"
 RAW_ENGINE_URL="$RAW_BASE/sherlook.sh"
 RAW_INSTALLER_URL="$RAW_BASE/install.sh"
-SHERLOOK_VERSION="6.1.0"
+SHERLOOK_VERSION="6.2.0"
 LOCATION_CACHE="$DATA_DIR/onionoo_exit_countries.cache"
 LOCATION_CATALOG="$DATA_DIR/location_catalog.tsv"
 LOCATION_CACHE_TTL=21600
 AUTO_HEAL_INTERVAL=5
 AUTO_HEAL_PARALLEL=16
-NODE_ROTATE_RETRIES=12
+NODE_ROTATE_RETRIES=20
 HEALTH_CONNECT_TIMEOUT=2
 HEALTH_MAX_TIME=5
 
@@ -535,7 +535,7 @@ EOF
 
     echo -e "${CYAN}[*] Routing ${WHITE}$code - $name ${CYAN}➔ Tor Port: ${MAGENTA}$out_port${CYAN}. Please wait...${NC}"
     run_tor_node "$conf_file"
-    draw_progress "Bootstrapping Tor connection"
+    echo -e "${CYAN}[*] Tor started. Beginning public-IP validation immediately (Attempt 1/${MAX_TOTAL_VALIDATION_ATTEMPTS}).${NC}"
 
     local connect_attempts=0
     local total_attempts=0
@@ -645,55 +645,65 @@ rotate_one_node_core() {
     fi
 
     local attempt new_ip result bad actual reason seen
+    local last_seen_ip="$old_ip"
+    local same_ip_count=0
+
+    # Attempt 1 is a real IP check immediately after Tor starts. NEWNYM is only
+    # used after an initial result, so startup time is never mistaken for retries.
     for attempt in $(seq 1 "$NODE_ROTATE_RETRIES"); do
-        send_newnym "$CTRL_PORT" "$CTRL_PASS" || true
-        sleep $((attempt <= 3 ? 2 : 4))
         new_ip=$(get_node_ip "$out_port")
 
         if is_valid_ipv4 "$new_ip"; then
             if [ "$new_ip" = "$old_ip" ]; then
-                continue
+                same_ip_count=$((same_ip_count+1))
+                [ "$silent" = "1" ] || echo -e "${YELLOW}  • $code kept old IP $new_ip (attempt $attempt/$NODE_ROTATE_RETRIES)${NC}"
+            else
+                result=$(check_ip_quality "$new_ip" "$code")
+                IFS='|' read -r bad actual reason seen <<< "$result"
+                if [ "$bad" = "0" ]; then
+                    printf '%s\n' "$new_ip" > "$ip_file"
+                    [ "$silent" = "1" ] || echo -e "${GREEN}  ✓ $code → $new_ip (attempt $attempt/$NODE_ROTATE_RETRIES)${NC}"
+                    return 0
+                fi
+                append_bad_ip "$bad_file" "$new_ip"
+                [ "$silent" = "1" ] || echo -e "${RED}  ✗ $code rejected $new_ip: $reason (attempt $attempt/$NODE_ROTATE_RETRIES)${NC}"
+                same_ip_count=0
             fi
-            result=$(check_ip_quality "$new_ip" "$code")
-            IFS='|' read -r bad actual reason seen <<< "$result"
-            if [ "$bad" = "0" ]; then
-                printf '%s\n' "$new_ip" > "$ip_file"
-                [ "$silent" = "1" ] || echo -e "${GREEN}  ✓ $code → $new_ip${NC}"
-                return 0
-            fi
-            append_bad_ip "$bad_file" "$new_ip"
-            [ "$silent" = "1" ] || echo -e "${RED}  ✗ $code rejected $new_ip: $reason${NC}"
         else
-            [ "$silent" = "1" ] || echo -e "${YELLOW}  • $code still has no valid IP (attempt $attempt/$NODE_ROTATE_RETRIES)${NC}"
+            [ "$silent" = "1" ] || echo -e "${YELLOW}  • $code no valid IP yet (attempt $attempt/$NODE_ROTATE_RETRIES)${NC}"
         fi
-    done
 
-    # Escalate: fully rebuild Tor with known-bad exits excluded.
-    if is_valid_ipv4 "$old_ip"; then append_bad_ip "$bad_file" "$old_ip"; fi
-    write_node_conf "$conf_file" "$out_port" "$CTRL_PORT" "$HASHED_PASS" "$inst_data_dir" "$code"
-    pkill -f "node_${code}_${out_port}\.conf" 2>/dev/null || true
-    sleep 1
-    run_tor_node "$conf_file"
-
-    for attempt in $(seq 1 "$NODE_ROTATE_RETRIES"); do
-        sleep 2
-        new_ip=$(get_node_ip "$out_port")
-        if is_valid_ipv4 "$new_ip"; then
-            [ "$new_ip" != "$old_ip" ] || continue
-            result=$(check_ip_quality "$new_ip" "$code")
-            IFS='|' read -r bad actual reason seen <<< "$result"
-            if [ "$bad" = "0" ]; then
-                printf '%s\n' "$new_ip" > "$ip_file"
-                [ "$silent" = "1" ] || echo -e "${GREEN}  ✓ $code → $new_ip (full restart)${NC}"
-                return 0
+        # Change circuit after every failed validation. Rebuild Tor after repeated
+        # identical/no-useful circuits instead of waiting until all 20 attempts end.
+        if [ "$attempt" -lt "$NODE_ROTATE_RETRIES" ]; then
+            if [ "$same_ip_count" -ge 2 ] || ! is_valid_ipv4 "$new_ip" || [ "$new_ip" = "$last_seen_ip" ]; then
+                [ "$silent" = "1" ] || echo -e "${CYAN}    > Requesting a fresh Tor circuit (NEWNYM)...${NC}"
+                send_newnym "$CTRL_PORT" "$CTRL_PASS" || true
+                sleep 2
+            else
+                send_newnym "$CTRL_PORT" "$CTRL_PASS" || true
+                sleep 1
             fi
-            append_bad_ip "$bad_file" "$new_ip"
+        fi
+        if is_valid_ipv4 "$new_ip"; then last_seen_ip="$new_ip"; fi
+
+        # Every 5 failed attempts perform a full rebuild while retaining the same
+        # 20-attempt budget. This gives dead nodes a genuine automatic recovery path.
+        if [ "$attempt" -lt "$NODE_ROTATE_RETRIES" ] && (( attempt % 5 == 0 )); then
+            [ "$silent" = "1" ] || echo -e "${YELLOW}    > ${code}: rebuilding Tor after $attempt failed validation attempts...${NC}"
+            if is_valid_ipv4 "$new_ip"; then append_bad_ip "$bad_file" "$new_ip"; fi
             write_node_conf "$conf_file" "$out_port" "$CTRL_PORT" "$HASHED_PASS" "$inst_data_dir" "$code"
             pkill -f "node_${code}_${out_port}\.conf" 2>/dev/null || true
             sleep 1
             run_tor_node "$conf_file"
+            sleep 2
+            same_ip_count=0
         fi
     done
+
+    # The 20-attempt loop above already performs NEWNYM and periodic full rebuilds.
+    # Do not start a second hidden retry loop here; that used to make the retry count
+    # misleading and could make recovery appear to begin only on later attempts.
 
     rm -f "$ip_file"
     echo "$(date '+%Y-%m-%d %H:%M:%S') rotation failed for $code" >> "$inst_data_dir/heal_fail.log"
@@ -1136,62 +1146,157 @@ view_active_nodes() {
 }
 
 edit_delete_nodes() {
-    draw_header
-    echo -e "📌 ${MAGENTA}[ DELETE ACTIVE NODE ]${NC}"
-    echo -e "${BLUE}──────────────────────────────────────────────────────────────────${NC}"
-    local active_nodes=()
-    for idx in "${ORDER[@]}"; do
-        IFS=':' read -r code name out_port <<< "${NODES[$idx]}"
-        if node_has_record "$code" "$out_port"; then
-            active_nodes+=("$idx")
-            local emoji="${EMOJIS[$code]}"
-            local status_label="${GREEN}RUNNING${NC}"
-            if ! pgrep -f "node_${code}_${out_port}.conf" > /dev/null; then
-                status_label="${RED}DEAD${NC}"
+    check_root
+
+    parse_node_selection() {
+        local input="$1" token a b n idx
+        local -a result=()
+        declare -A seen=()
+        input="${input// /}"
+        input="${input//;/,}"
+        IFS=',' read -ra tokens <<< "$input"
+        for token in "${tokens[@]}"; do
+            [ -z "$token" ] && continue
+            if [[ "$token" =~ ^([0-9]+)-([0-9]+)$ ]]; then
+                a=$((10#${BASH_REMATCH[1]})); b=$((10#${BASH_REMATCH[2]}))
+                if (( a > b )); then n=$a; a=$b; b=$n; fi
+                for ((n=a; n<=b; n++)); do
+                    idx=$(printf '%02d' "$n")
+                    if [[ -n "${NODES[$idx]:-}" && -z "${seen[$idx]:-}" ]]; then
+                        result+=("$idx"); seen[$idx]=1
+                    fi
+                done
+            elif [[ "$token" =~ ^[0-9]+$ ]]; then
+                idx=$(printf '%02d' "$((10#$token))")
+                if [[ -n "${NODES[$idx]:-}" && -z "${seen[$idx]:-}" ]]; then
+                    result+=("$idx"); seen[$idx]=1
+                fi
             fi
-            printf "  ${CYAN}[%s]${NC} %s %-18s \tTorPort:${MAGENTA}%-6s${NC} \t%b\n" "$idx" "$emoji" "$name" "$out_port" "$status_label"
+        done
+        printf '%s\n' "${result[@]}"
+    }
+
+    delete_node_ids() {
+        local idx code name out_port
+        local -a ids=("$@")
+        for idx in "${ids[@]}"; do
+            IFS=':' read -r code name out_port <<< "${NODES[$idx]}"
+            echo -e "${YELLOW}[*] Removing $idx ${EMOJIS[$code]} $name...${NC}"
+            pkill -9 -f "node_${code}_${out_port}\\.conf" 2>/dev/null || true
+            rm -f "$BASE_DIR/node_${code}_${out_port}.conf"
+            rm -rf "$DATA_DIR/${code}_${out_port}" 2>/dev/null || true
+            echo -e "${GREEN}  ✓ $idx removed${NC}"
+        done
+    }
+
+    repair_node_ids() {
+        local idx code name out_port jobs=0 max_jobs=6 total=0
+        local -a ids=("$@") pids=()
+        for idx in "${ids[@]}"; do
+            IFS=':' read -r code name out_port <<< "${NODES[$idx]}"
+            [ -f "$BASE_DIR/node_${code}_${out_port}.conf" ] || continue
+            total=$((total+1))
+            rotate_one_node "$code" "$name" "$out_port" 0 &
+            pids+=("$!")
+            jobs=$((jobs+1))
+            if (( jobs >= max_jobs )); then
+                wait "${pids[0]}" 2>/dev/null || true
+                pids=("${pids[@]:1}")
+                jobs=$((jobs-1))
+            fi
+        done
+        for pid in "${pids[@]}"; do wait "$pid" 2>/dev/null || true; done
+        echo -e "${GREEN}[+] Repair/rebuild completed for $total node(s). Each node had up to $NODE_ROTATE_RETRIES real attempts.${NC}"
+    }
+
+    while true; do
+        draw_header
+        echo -e "📌 ${MAGENTA}[ NODE MAINTENANCE / AUTO-REPAIR ]${NC}"
+        echo -e "${BLUE}────────────────────────────────────────────────────────────────────────${NC}"
+        echo -e "  ${CYAN}ID   COUNTRY              TorPort     STATUS${NC}"
+        echo -e "${BLUE}────────────────────────────────────────────────────────────────────────${NC}"
+
+        local active_nodes=() idx code name out_port status ip_file ip
+        for idx in "${ORDER[@]}"; do
+            IFS=':' read -r code name out_port <<< "${NODES[$idx]}"
+            [ -f "$BASE_DIR/node_${code}_${out_port}.conf" ] || continue
+            active_nodes+=("$idx")
+            ip_file="$DATA_DIR/${code}_${out_port}/last_ip.txt"
+            ip=""
+            [ -s "$ip_file" ] && ip=$(head -n1 "$ip_file" | tr -d '\r\n')
+            if node_process_running "$code" "$out_port" && is_valid_ipv4 "$ip"; then
+                status="${GREEN}ONLINE${NC}"
+            elif node_process_running "$code" "$out_port"; then
+                status="${YELLOW}HEALING${NC}"
+            else
+                status="${RED}DEAD${NC}"
+            fi
+            printf "  ${CYAN}[%s]${NC} %-20s ${MAGENTA}%-8s${NC} %b\n" "$idx" "$name" "$out_port" "$status"
+        done
+
+        if [ ${#active_nodes[@]} -eq 0 ]; then
+            echo -e "  ${RED}No installed nodes found.${NC}"
         fi
+        echo -e "${BLUE}────────────────────────────────────────────────────────────────────────${NC}"
+        echo -e "  ${GREEN}[1]${NC} Repair/Rebuild selected nodes ${WHITE}(e.g. 02,04,06 or 2,4,6 or 2-6)${NC}"
+        echo -e "  ${RED}[2]${NC} Delete selected nodes ${WHITE}(same multi-selection syntax)${NC}"
+        echo -e "  ${YELLOW}[3]${NC} Auto-repair ALL DEAD/HEALING nodes"
+        echo -e "  ${CYAN}[4]${NC} Refresh health/status"
+        echo -e "  ${RED}[0]${NC} Back"
+        echo -e "${BLUE}────────────────────────────────────────────────────────────────────────${NC}"
+
+        local action selection
+        read -r -p "Select action: " action < /dev/tty || return
+        case "$action" in
+            1)
+                read -r -p "Node IDs: " selection < /dev/tty || continue
+                mapfile -t selected < <(parse_node_selection "$selection")
+                if [ ${#selected[@]} -eq 0 ]; then
+                    echo -e "${RED}[!] No valid node IDs selected.${NC}"
+                else
+                    repair_node_ids "${selected[@]}"
+                fi
+                read -r -p "Press Enter..." < /dev/tty
+                ;;
+            2)
+                read -r -p "Node IDs: " selection < /dev/tty || continue
+                mapfile -t selected < <(parse_node_selection "$selection")
+                if [ ${#selected[@]} -eq 0 ]; then
+                    echo -e "${RED}[!] No valid node IDs selected.${NC}"
+                else
+                    echo -e "${RED}[!] This will permanently remove ${#selected[@]} node(s).${NC}"
+                    read -r -p "Confirm (yes/no): " confirm < /dev/tty
+                    if [ "$confirm" = "yes" ]; then
+                        delete_node_ids "${selected[@]}"
+                    else
+                        echo -e "${YELLOW}[-] Cancelled.${NC}"
+                    fi
+                fi
+                read -r -p "Press Enter..." < /dev/tty
+                ;;
+            3)
+                local -a dead_ids=()
+                for idx in "${active_nodes[@]}"; do
+                    IFS=':' read -r code name out_port <<< "${NODES[$idx]}"
+                    ip_file="$DATA_DIR/${code}_${out_port}/last_ip.txt"
+                    ip=""
+                    [ -s "$ip_file" ] && ip=$(head -n1 "$ip_file" | tr -d '\r\n')
+                    if ! node_process_running "$code" "$out_port" || ! is_valid_ipv4 "$ip"; then
+                        dead_ids+=("$idx")
+                    fi
+                done
+                if [ ${#dead_ids[@]} -eq 0 ]; then
+                    echo -e "${GREEN}[+] No DEAD/HEALING nodes require repair.${NC}"
+                else
+                    echo -e "${YELLOW}[*] Auto-repairing: ${dead_ids[*]}${NC}"
+                    repair_node_ids "${dead_ids[@]}"
+                fi
+                read -r -p "Press Enter..." < /dev/tty
+                ;;
+            4) continue ;;
+            0) return ;;
+        esac
     done
-    if [ ${#active_nodes[@]} -eq 0 ]; then
-        echo -e "  ${RED}No installed nodes to delete.${NC}"; sleep 2; return
-    fi
-    echo -e "${BLUE}──────────────────────────────────────────────────────────────────${NC}"
-    echo -e "  ${RED}[99] DELETE ALL ACTIVE NODES (Clear All)${NC}"
-    echo -e "${BLUE}──────────────────────────────────────────────────────────────────${NC}"
-
-    read -p "$(echo -e ${CYAN}"Select ID to stop/delete (or 0 to cancel): "${NC})" del_sel
-
-    if [[ "$del_sel" == "0" || -z "$del_sel" ]]; then return; fi
-
-    if [[ "$del_sel" == "99" ]]; then
-        echo -e "\n${YELLOW}[!] Deleting ALL active nodes... Please wait.${NC}"
-        for idx in "${active_nodes[@]}"; do
-            IFS=':' read -r code name out_port <<< "${NODES[$idx]}"
-            pkill -9 -f "node_${code}_${out_port}.conf" 2>/dev/null || true
-        done
-        sleep 1.5
-        for idx in "${active_nodes[@]}"; do
-            IFS=':' read -r code name out_port <<< "${NODES[$idx]}"
-            rm -f "$BASE_DIR/node_${code}_${out_port}.conf"
-            rm -rf "$DATA_DIR/${code}_${out_port}" 2>/dev/null || true
-        done
-        echo -e "${GREEN}[+] All nodes removed successfully.${NC}"; sleep 2
-        return
-    fi
-
-    if [[ "$del_sel" =~ ^[0-9]+$ ]]; then
-        del_sel=$(printf "%02d" "$((10#$del_sel))" 2>/dev/null || echo "")
-        if [[ -n "${NODES[$del_sel]:-}" ]]; then
-            IFS=':' read -r code name out_port <<< "${NODES[$del_sel]}"
-            pkill -9 -f "node_${code}_${out_port}.conf" 2>/dev/null || true
-            sleep 1
-            rm -f "$BASE_DIR/node_${code}_${out_port}.conf"
-            rm -rf "$DATA_DIR/${code}_${out_port}" 2>/dev/null || true
-            echo -e "${GREEN}[+] Node removed.${NC}"; sleep 2
-        else
-            echo -e "${RED}[!] Invalid Node ID.${NC}"; sleep 1
-        fi
-    fi
 }
 
 # ================= NEXATIS PANEL INTEGRATION =================
