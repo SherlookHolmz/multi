@@ -20,7 +20,7 @@ INSTALL_PATH="/usr/local/bin/sherlook"
 RAW_BASE="https://raw.githubusercontent.com/SherlookHolmz/multi/main"
 RAW_ENGINE_URL="$RAW_BASE/sherlook.sh"
 RAW_INSTALLER_URL="$RAW_BASE/install.sh"
-SHERLOOK_VERSION="6.2.0"
+SHERLOOK_VERSION="6.2.1"
 LOCATION_CACHE="$DATA_DIR/onionoo_exit_countries.cache"
 LOCATION_CATALOG="$DATA_DIR/location_catalog.tsv"
 LOCATION_CACHE_TTL=21600
@@ -39,6 +39,10 @@ MAX_QUALITY_ATTEMPTS=8
 MAX_NEWNYM_TRIES=2
 # Maximum total public-IP validation cycles for one node deployment
 MAX_TOTAL_VALIDATION_ATTEMPTS=20
+# After this many country-specific failures, offer a fallback route while keeping the node label.
+COUNTRY_FALLBACK_THRESHOLD=5
+FALLBACK_AUTO_ON_NONINTERACTIVE=1
+
 
 # Format: "CountryCode : CountryName : TorPort"
 declare -A NODES=(
@@ -100,9 +104,211 @@ declare -A LOW_SUPPLY_WARN=(
 
 ORDER=({01..83})
 
+# Preferred fallback countries when the requested exit country repeatedly fails
+# GeoIP validation. The node keeps its original display/label country, while
+# route_code records the country actually used for ExitNodes. Orders favor
+# nearby / well-supplied Tor locations rather than arbitrary distant countries.
+declare -A FALLBACK_COUNTRIES=(
+    [LU]="DE FR NL BE CH AT"
+    [BE]="NL FR DE LU CH GB"
+    [NL]="DE BE FR GB DK"
+    [CH]="DE FR AT IT NL BE"
+    [AT]="DE CZ HU CH IT SI"
+    [FR]="DE BE CH IT ES NL GB"
+    [DE]="NL FR AT CH BE CZ DK PL"
+    [GB]="IE FR NL BE DE DK"
+    [IE]="GB FR NL"
+    [ES]="PT FR IT"
+    [PT]="ES FR"
+    [IT]="CH AT FR DE SI"
+    [SI]="AT IT HR DE"
+    [HR]="SI AT HU IT"
+    [CZ]="DE AT PL SK"
+    [PL]="DE CZ SK SE"
+    [SK]="CZ AT PL HU"
+    [HU]="AT SK RO HR SI"
+    [RO]="HU BG AT PL"
+    [BG]="RO GR RS"
+    [GR]="BG IT RO"
+    [DK]="DE NL SE NO"
+    [SE]="DK NO FI DE"
+    [NO]="SE DK DE FI"
+    [FI]="SE DE NO DK"
+    [EE]="FI LV SE"
+    [LV]="EE LT SE DE"
+    [LT]="LV PL DE"
+    [IS]="GB IE NO DK"
+    [TR]="BG GR DE RO"
+    [RS]="HU HR BG RO"
+    [BA]="HR RS AT DE"
+    [AL]="GR IT HR"
+    [MD]="RO UA PL"
+    [UA]="PL RO CZ"
+    [RU]="FI DE SE PL"
+    [CA]="US GB NL DE"
+    [US]="CA GB NL DE FR"
+    [MX]="US CA"
+    [CR]="US MX CA"
+    [PA]="US CR MX CA"
+    [DO]="US PA MX"
+    [BO]="CL PE BR AR"
+    [PE]="CL BO US"
+    [CL]="AR PE US"
+    [AR]="CL BR UY"
+    [UY]="AR BR CL"
+    [BR]="AR CL US"
+    [CO]="US MX PA"
+    [EC]="US CO PE"
+    [GT]="MX US CR"
+    [VE]="CO BR US"
+    [AU]="NZ SG JP"
+    [NZ]="AU SG JP"
+    [JP]="KR SG HK AU"
+    [KR]="JP SG HK"
+    [SG]="MY HK JP AU"
+    [MY]="SG TH ID"
+    [TH]="MY SG JP"
+    [ID]="SG MY AU"
+    [HK]="SG JP KR"
+    [TW]="JP KR HK SG"
+    [PH]="SG JP HK MY"
+    [VN]="SG JP MY TH"
+    [IN]="SG AE DE GB"
+    [BD]="IN SG MY"
+    [LK]="IN SG"
+    [PK]="AE TR DE GB"
+    [KZ]="RU DE PL"
+    [GE]="TR DE PL"
+    [AZ]="TR GE DE"
+    [IL]="DE FR NL GB"
+    [AE]="DE NL GB FR"
+    [SA]="AE TR DE NL"
+    [QA]="AE TR DE NL"
+    [EG]="DE FR IT NL"
+    [MA]="FR ES PT"
+    [TN]="FR IT DE"
+    [ZA]="GB NL DE FR"
+    [NG]="GB FR DE NL"
+    [KE]="GB DE FR NL"
+    [SC]="FR DE GB"
+)
+
 expand_iso_locations() { return 0; }
 
 # ================= CORE FUNCTIONS =================
+# Resolve the country actually used by a node. The UI/API label remains the original node country.
+node_route_code() {
+    local code="$1" out_port="$2"
+    local f="$DATA_DIR/${code}_${out_port}/route_code.txt"
+    if [ -s "$f" ]; then
+        tr -d '\r\n ' < "$f" | tr '[:lower:]' '[:upper:]'
+    else
+        printf '%s\n' "$code"
+    fi
+}
+
+set_node_route_code() {
+    local code="$1" out_port="$2" route="$3"
+    mkdir -p "$DATA_DIR/${code}_${out_port}"
+    printf '%s\n' "${route^^}" > "$DATA_DIR/${code}_${out_port}/route_code.txt"
+}
+
+clear_node_route_code() {
+    local code="$1" out_port="$2"
+    rm -f "$DATA_DIR/${code}_${out_port}/route_code.txt"
+}
+
+fallback_candidates() {
+    local code="${1^^}" candidate count
+    local -a candidates=()
+    declare -A seen=()
+    for candidate in ${FALLBACK_COUNTRIES[$code]:-}; do
+        candidate="${candidate^^}"
+        [ "$candidate" = "$code" ] && continue
+        [ -n "${seen[$candidate]:-}" ] && continue
+        seen[$candidate]=1
+        candidates+=("$candidate")
+    done
+    # Generic fallback for countries without an explicit regional map.
+    if [ ${#candidates[@]} -eq 0 ]; then
+        for candidate in DE FR NL GB US CA; do
+            [ "$candidate" = "$code" ] && continue
+            candidates+=("$candidate")
+        done
+    fi
+    printf '%s\n' "${candidates[@]}"
+}
+
+country_display_name() {
+    local code="${1^^}"
+    local idx
+    for idx in "${ORDER[@]}"; do
+        IFS=':' read -r c n p <<< "${NODES[$idx]}"
+        if [ "$c" = "$code" ]; then
+            printf '%s\n' "$n"
+            return 0
+        fi
+    done
+    country_name "$code"
+}
+
+choose_fallback_route() {
+    local code="${1^^}" name="$2" out_port="$3" interactive="${4:-1}" route candidate count
+    local -a candidates=()
+    mapfile -t candidates < <(fallback_candidates "$code")
+    [ ${#candidates[@]} -eq 0 ] && return 1
+
+    if [ "$interactive" = "1" ] && [ -t 0 ] && [ -t 1 ]; then
+        echo -e "\n${YELLOW}[!] $name ($code) failed to obtain a verified $code IP after $COUNTRY_FALLBACK_THRESHOLD attempts.${NC}"
+        echo -e "  ${CYAN}[1]${NC} Continue trying $code"
+        echo -e "  ${CYAN}[2]${NC} Use a nearby Tor country automatically (keep $name/$code label)"
+        echo -e "  ${RED}[3]${NC} Stop this node"
+        read -r -p "Choice [1-3]: " route_choice < /dev/tty || route_choice=2
+        case "$route_choice" in
+            1) return 2 ;;
+            3) return 3 ;;
+            2) ;;
+            *) route_choice=2 ;;
+        esac
+    elif [ "$FALLBACK_AUTO_ON_NONINTERACTIVE" != "1" ]; then
+        return 2
+    fi
+
+    for candidate in "${candidates[@]}"; do
+        count=$(onionoo_exit_count "${candidate,,}")
+        if [ "$count" = "-1" ] || [ "$count" -ge "$ONIONOO_MIN_EXITS" ] 2>/dev/null; then
+            route="$candidate"
+            break
+        fi
+    done
+    [ -n "${route:-}" ] || return 1
+    set_node_route_code "$code" "$out_port" "$route"
+    printf '%s\n' "$route"
+}
+
+fallback_or_retry_deploy() {
+    local code="$1" name="$2" out_port="$3" interactive="${4:-1}" route_choice route
+    route=$(choose_fallback_route "$code" "$name" "$out_port" "$interactive")
+    case "$?" in
+        0)
+            [ -n "$route" ] || return 1
+            echo -e "${YELLOW}[!] ${EMOJIS[$code]} $name will keep its ${WHITE}$name${YELLOW} label, but route exits through ${WHITE}${route}${YELLOW}.${NC}"
+            return 0
+            ;;
+        2) return 2 ;;
+        3) return 3 ;;
+        *) return 1 ;;
+    esac
+}
+
+validate_node_ip() {
+    local ip="$1" expected="$2"
+    local result bad actual reason seen
+    result=$(check_ip_quality "$ip" "$expected")
+    IFS='|' read -r bad actual reason seen <<< "$result"
+    printf '%s|%s|%s|%s\n' "$bad" "$actual" "$reason" "$seen"
+}
+
 
 is_valid_ipv4() {
     local ip="${1//$'\r'/}"
@@ -331,6 +537,7 @@ send_newnym() {
 write_node_conf() {
     local conf_file="$1" out_port="$2" control_port="$3" hashed_pass="$4"
     local inst_data_dir="$5" code="$6"
+    local route_code="$(node_route_code "$code" "$out_port")"
     local bad_file="$inst_data_dir/bad_exits.txt"
     local exclude_line=""
 
@@ -392,7 +599,8 @@ health_check_node() {
     fi
 
     if [ "$current_ip" != "$old_ip" ] || ! is_valid_ipv4 "$old_ip"; then
-        result=$(check_ip_quality "$current_ip" "$code")
+        local expected_route="$(node_route_code "$code" "$out_port")"
+        result=$(check_ip_quality "$current_ip" "$expected_route")
         IFS='|' read -r bad actual reason seen <<< "$result"
         if [ "$bad" = "0" ]; then
             printf '%s\n' "$current_ip" > "$ip_file"
@@ -493,6 +701,7 @@ deploy_node() {
     local ctrl_file="$inst_data_dir/control.env"
     local bad_file="$inst_data_dir/bad_exits.txt"
 
+    clear_node_route_code "$code" "$out_port"
     if ! check_country_exit_availability "$code" "$name"; then
         cleanup_failed_node "$code" "$out_port"
         return 2
@@ -504,15 +713,12 @@ deploy_node() {
 
     if [ -n "${LOW_SUPPLY_WARN[$code]:-}" ]; then
         echo -e "${YELLOW}[!] Heads up: $name usually has very few Tor exit relays.${NC}"
-        echo -e "${YELLOW}    The node will NOT be accepted unless the public IP verifies as $code.${NC}"
     fi
 
     local ctrl_pass hashed_pass control_port
     if [ -f "$ctrl_file" ]; then
         source "$ctrl_file" 2>/dev/null || true
-        ctrl_pass="$CTRL_PASS"
-        hashed_pass="$HASHED_PASS"
-        control_port="$CTRL_PORT"
+        ctrl_pass="$CTRL_PASS"; hashed_pass="$HASHED_PASS"; control_port="$CTRL_PORT"
     else
         ctrl_pass=$(openssl rand -hex 16)
         hashed_pass=$(tor --hash-password "$ctrl_pass" 2>/dev/null | tail -n1)
@@ -525,81 +731,112 @@ EOF
         chmod 600 "$ctrl_file"
     fi
 
-    write_node_conf "$conf_file" "$out_port" "$control_port" "$hashed_pass" "$inst_data_dir" "$code"
-    chown debian-tor:debian-tor "$conf_file" 2>/dev/null || true
+    local country_round=0
+    while true; do
+        local route_code="$(node_route_code "$code" "$out_port")"
+        write_node_conf "$conf_file" "$out_port" "$control_port" "$hashed_pass" "$inst_data_dir" "$code"
+        chown debian-tor:debian-tor "$conf_file" 2>/dev/null || true
 
-    if pgrep -f "node_${code}_${out_port}.conf" > /dev/null; then
-        pkill -f "node_${code}_${out_port}.conf" 2>/dev/null || true
-        sleep 2
-    fi
+        if pgrep -f "node_${code}_${out_port}" > /dev/null; then
+            pkill -f "node_${code}_${out_port}\.conf" 2>/dev/null || true
+            sleep 2
+        fi
 
-    echo -e "${CYAN}[*] Routing ${WHITE}$code - $name ${CYAN}➔ Tor Port: ${MAGENTA}$out_port${CYAN}. Please wait...${NC}"
-    run_tor_node "$conf_file"
-    echo -e "${CYAN}[*] Tor started. Beginning public-IP validation immediately (Attempt 1/${MAX_TOTAL_VALIDATION_ATTEMPTS}).${NC}"
+        echo -e "${CYAN}[*] Routing ${WHITE}$code - $name ${CYAN}➔ ExitNodes ${MAGENTA}$route_code${CYAN}, Tor Port: ${MAGENTA}$out_port${CYAN}.${NC}"
+        run_tor_node "$conf_file"
+        echo -e "${CYAN}[*] Tor started. Beginning public-IP validation immediately (Attempt 1/${MAX_TOTAL_VALIDATION_ATTEMPTS}).${NC}"
 
-    local connect_attempts=0
-    local total_attempts=0
-    local newnym_tries=0
-    local last_ip=""
+        local total_attempts=0
+        local newnym_tries=0
+        local last_ip=""
+        local country_failures=0
+        local switched_route=0
 
-    while [ "$total_attempts" -lt "$MAX_TOTAL_VALIDATION_ATTEMPTS" ]; do
-        local public_ip
-        public_ip=$(curl -4 -sS --socks5-hostname 127.0.0.1:"$out_port" https://api.ipify.org --connect-timeout 5 --max-time 12 2>/dev/null | tr -d '\0\r\n' || true)
-
-        if [ -z "$public_ip" ] || ! [[ "$public_ip" =~ ^[0-9]+(\.[0-9]+){3}$ ]]; then
-            connect_attempts=$((connect_attempts+1))
+        while [ "$total_attempts" -lt "$MAX_TOTAL_VALIDATION_ATTEMPTS" ]; do
             total_attempts=$((total_attempts+1))
-            echo -e "${CYAN}[*] Waiting for Tor connection (Attempt $total_attempts/$MAX_TOTAL_VALIDATION_ATTEMPTS)...${NC}"
-            sleep 3
+            local public_ip
+            public_ip=$(curl -4 -sS --socks5-hostname 127.0.0.1:"$out_port" https://api.ipify.org --connect-timeout 5 --max-time 12 2>/dev/null | tr -d '\0\r\n' || true)
+
+            if [ -z "$public_ip" ] || ! is_valid_ipv4 "$public_ip"; then
+                echo -e "${CYAN}[*] Waiting for Tor connection (Attempt $total_attempts/$MAX_TOTAL_VALIDATION_ATTEMPTS)...${NC}"
+                sleep 3
+            else
+                echo -e "${CYAN}[*] Verifying ${MAGENTA}$public_ip${CYAN} against multiple GeoIP sources for ${WHITE}$route_code${CYAN}...${NC}"
+                local result is_bad actual_cc reason seen_ccs
+                result=$(validate_node_ip "$public_ip" "$route_code")
+                IFS='|' read -r is_bad actual_cc reason seen_ccs <<< "$result"
+
+                if [ "$is_bad" = "0" ]; then
+                    printf '%s\n' "$public_ip" > "$ip_file"
+                    echo -e "${GREEN}[+] VERIFIED: $public_ip → label=$code/$name route=$route_code${NC}"
+                    echo -e "${GREEN}[+] GeoIP sources: ${seen_ccs}${NC}"
+                    echo -e "${GREEN}[+] Online -> ${WHITE}$code - $name ${GREEN}($public_ip)${NC}\n"
+                    return 0
+                fi
+
+                country_failures=$((country_failures+1))
+                echo -e "${RED}[-] Rejected $public_ip: ${reason} | detected=${seen_ccs:-unknown} | expected=$route_code${NC}"
+                append_bad_ip "$bad_file" "$public_ip"
+
+                if [ "$country_failures" -ge "$COUNTRY_FALLBACK_THRESHOLD" ] && [ "$route_code" = "$code" ]; then
+                    if fallback_or_retry_deploy "$code" "$name" "$out_port" 1; then
+                        route_code="$(node_route_code "$code" "$out_port")"
+                        switched_route=1
+                        echo -e "${YELLOW}[*] Switching $name to fallback route ${WHITE}$route_code${YELLOW}; IP label remains ${WHITE}$name${YELLOW}. Restarting validation from Attempt 1.${NC}"
+                        break
+                    else
+                        case "$?" in
+                            2)
+                                echo -e "${YELLOW}[*] Continuing with the requested country $code.${NC}"
+                                country_failures=0
+                                ;;
+                            3)
+                                cleanup_failed_node "$code" "$out_port"
+                                return 1
+                                ;;
+                            *) ;;
+                        esac
+                    fi
+                fi
+
+                if [ "$public_ip" = "$last_ip" ]; then
+                    newnym_tries=$MAX_NEWNYM_TRIES
+                fi
+                last_ip="$public_ip"
+                if [ "$newnym_tries" -lt "$MAX_NEWNYM_TRIES" ]; then
+                    echo -e "${CYAN}    > Requesting a new circuit (NEWNYM)...${NC}"
+                    send_newnym "$control_port" "$ctrl_pass"
+                    newnym_tries=$((newnym_tries+1))
+                    sleep 6
+                else
+                    echo -e "${YELLOW}    > Same/bad exit detected. Rebuilding Tor with this IP excluded...${NC}"
+                    write_node_conf "$conf_file" "$out_port" "$control_port" "$hashed_pass" "$inst_data_dir" "$code"
+                    pkill -f "node_${code}_${out_port}\.conf" 2>/dev/null || true
+                    sleep 2
+                    run_tor_node "$conf_file"
+                    sleep 4
+                    newnym_tries=0
+                fi
+            fi
+        done
+
+        if [ "$switched_route" -eq 1 ]; then
             continue
         fi
 
-        echo -e "${CYAN}[*] Verifying ${MAGENTA}$public_ip${CYAN} against multiple GeoIP sources for ${WHITE}$code${CYAN}...${NC}"
-        local result is_bad actual_cc reason seen_ccs
-        result=$(check_ip_quality "$public_ip" "$code")
-        IFS='|' read -r is_bad actual_cc reason seen_ccs <<< "$result"
-        total_attempts=$((total_attempts+1))
-
-        if [ "$is_bad" == "0" ]; then
-            echo "$public_ip" > "$ip_file"
-            echo -e "${GREEN}[+] VERIFIED: $public_ip → $code - $name${NC}"
-            echo -e "${GREEN}[+] GeoIP sources: ${seen_ccs}${NC}"
-            echo -e "${GREEN}[+] Online -> ${WHITE}$code - $name ${GREEN}($public_ip)${NC}\n"
-            return 0
+        # If the requested country exhausted all 20 attempts, offer the fallback once more.
+        if [ "$route_code" = "$code" ]; then
+            if fallback_or_retry_deploy "$code" "$name" "$out_port" 1; then
+                echo -e "${YELLOW}[*] Fallback route selected. Restarting from Attempt 1 with route ${WHITE}$(node_route_code "$code" "$out_port")${YELLOW}.${NC}"
+                continue
+            fi
         fi
 
-        echo -e "${RED}[-] Rejected $public_ip: ${reason} | detected=${seen_ccs:-unknown} | expected=$code${NC}"
-
-        if ! grep -qxF "$public_ip" "$bad_file" 2>/dev/null; then
-            echo "$public_ip" >> "$bad_file"
-            sort -u -o "$bad_file" "$bad_file" 2>/dev/null || true
-        fi
-
-        if [ "$public_ip" == "$last_ip" ]; then
-            newnym_tries=$MAX_NEWNYM_TRIES
-        fi
-        last_ip="$public_ip"
-
-        if [ "$newnym_tries" -lt "$MAX_NEWNYM_TRIES" ]; then
-            echo -e "${CYAN}    > Requesting a new circuit (NEWNYM)...${NC}"
-            send_newnym "$control_port" "$ctrl_pass"
-            newnym_tries=$((newnym_tries+1))
-            sleep 6
-        else
-            echo -e "${YELLOW}    > Same/bad exit detected. Rebuilding Tor with this IP excluded...${NC}"
-            write_node_conf "$conf_file" "$out_port" "$control_port" "$hashed_pass" "$inst_data_dir" "$code"
-            pkill -f "node_${code}_${out_port}.conf" 2>/dev/null || true
-            sleep 2
-            run_tor_node "$conf_file"
-            sleep 7
-            newnym_tries=0
-        fi
+        cleanup_failed_node "$code" "$out_port"
+        echo -e "${RED}[-] FAILED: No verified ${route_code} exit IP was available after $MAX_TOTAL_VALIDATION_ATTEMPTS attempts.${NC}"
+        echo -e "${YELLOW}[!] The node was NOT marked online and no unverified/wrong-country IP was accepted.${NC}\n"
+        return 1
     done
-
-    cleanup_failed_node "$code" "$out_port"
-    echo -e "${RED}[-] FAILED: No verified $code exit IP was available after $MAX_TOTAL_VALIDATION_ATTEMPTS attempts.${NC}"
-    echo -e "${YELLOW}[!] The node was NOT marked online and no wrong-country IP was accepted.${NC}\n"
-    return 1
 }
 
 # ================= IP ROTATION =================
@@ -645,6 +882,7 @@ rotate_one_node_core() {
     fi
 
     local attempt new_ip result bad actual reason seen
+    local expected_route="$(node_route_code "$code" "$out_port")"
     local last_seen_ip="$old_ip"
     local same_ip_count=0
 
@@ -658,7 +896,7 @@ rotate_one_node_core() {
                 same_ip_count=$((same_ip_count+1))
                 [ "$silent" = "1" ] || echo -e "${YELLOW}  • $code kept old IP $new_ip (attempt $attempt/$NODE_ROTATE_RETRIES)${NC}"
             else
-                result=$(check_ip_quality "$new_ip" "$code")
+                result=$(check_ip_quality "$new_ip" "$expected_route")
                 IFS='|' read -r bad actual reason seen <<< "$result"
                 if [ "$bad" = "0" ]; then
                     printf '%s\n' "$new_ip" > "$ip_file"
@@ -666,7 +904,7 @@ rotate_one_node_core() {
                     return 0
                 fi
                 append_bad_ip "$bad_file" "$new_ip"
-                [ "$silent" = "1" ] || echo -e "${RED}  ✗ $code rejected $new_ip: $reason (attempt $attempt/$NODE_ROTATE_RETRIES)${NC}"
+                [ "$silent" = "1" ] || echo -e "${RED}  ✗ $code rejected $new_ip for route $expected_route: $reason (attempt $attempt/$NODE_ROTATE_RETRIES)${NC}"
                 same_ip_count=0
             fi
         else
