@@ -1,48 +1,46 @@
 #!/usr/bin/env bash
-# Sherlook Multi v6.2.5 installer
+# Sherlook Multi v6.2.6 installer
 set -euo pipefail
 
-VERSION="6.2.5"
-TARGET="/usr/local/bin/sherlook"
-CACHE_DIR="/root/.sherlook"
-BASE_DIR="/etc/tor/sherlook_nodes"
-DATA_DIR="/var/lib/tor/sherlook_nodes"
-SELF_DIR="$(cd "$(dirname "$0")" && pwd)"
-LOCAL_ENGINE="$SELF_DIR/sherlook.sh"
-RAW_ENGINE_URL="https://raw.githubusercontent.com/SherlookHolmz/multi/main/sherlook.sh"
+VERSION='6.2.6'
+RAW_BASE='https://raw.githubusercontent.com/SherlookHolmz/multi/main'
+RAW_ENGINE_URL="$RAW_BASE/sherlook.sh"
+TARGET='/usr/local/bin/sherlook'
+INSTALLER_TARGET='/usr/local/bin/sherlook-install'
+CACHE_DIR='/root/.sherlook'
+BASE_DIR='/etc/tor/sherlook_nodes'
+DATA_DIR='/var/lib/tor/sherlook_nodes'
 
-[ "${EUID:-$(id -u)}" -eq 0 ] || { echo '[!] Run as root.'; exit 1; }
+[ "${EUID:-$(id -u)}" -eq 0 ] || { echo '[!] Run as root.' >&2; exit 1; }
 
+need_cmd() { command -v "$1" >/dev/null 2>&1 || { echo "[!] Missing command: $1" >&2; exit 1; }; }
+fetch_file() {
+  local url="$1" out="$2"
+  if command -v curl >/dev/null 2>&1; then curl -4 -fsSL --retry 4 --retry-all-errors --connect-timeout 10 --max-time 120 -o "$out" "$url"
+  else wget -qO "$out" "$url"; fi
+}
+
+need_cmd bash
 apt-get update -qq
-DEBIAN_FRONTEND=noninteractive apt-get install -y tor tor-geoipdb curl jq openssl cron ca-certificates util-linux python3
+DEBIAN_FRONTEND=noninteractive apt-get install -y tor tor-geoipdb curl jq openssl cron ca-certificates util-linux python3 >/dev/null
 
-systemctl stop tor 2>/dev/null || true
-systemctl disable tor 2>/dev/null || true
 mkdir -p "$CACHE_DIR" "$BASE_DIR" "$DATA_DIR"
 chmod 700 "$CACHE_DIR" "$BASE_DIR"
+chmod 700 "$DATA_DIR"
 chown -R debian-tor:debian-tor "$DATA_DIR" 2>/dev/null || true
 
-TMP="$(mktemp /tmp/sherlook-install.XXXXXX.sh)"
-cleanup() { rm -f "$TMP"; }
-trap cleanup EXIT
-
-if [ -f "$LOCAL_ENGINE" ]; then
-    cp "$LOCAL_ENGINE" "$TMP"
-else
-    curl -4 -fsSL --retry 5 --retry-all-errors --connect-timeout 10 --max-time 120 -o "$TMP" "$RAW_ENGINE_URL"
-fi
-
+TMP=$(mktemp /tmp/sherlook-engine.XXXXXX.sh)
+trap 'rm -f "$TMP"' EXIT
+fetch_file "$RAW_ENGINE_URL" "$TMP"
 bash -n "$TMP"
+grep -q "VERSION='6\\.2\\.6'\|VERSION=\"6\\.2\\.6\"" "$TMP" || { echo '[!] Refusing an unexpected remote engine.' >&2; exit 1; }
 install -m 755 "$TMP" "$TARGET"
 install -m 755 "$TMP" "$CACHE_DIR/sherlook.sh"
-
-# Existing panel token/config must remain private.
-[ -f "$BASE_DIR/nexatis_panel.conf" ] && chmod 600 "$BASE_DIR/nexatis_panel.conf" || true
-[ -f "$BASE_DIR/panel_node_map.json" ] && chmod 600 "$BASE_DIR/panel_node_map.json" || true
+install -m 755 "$0" "$INSTALLER_TARGET" 2>/dev/null || true
 
 cat > /etc/systemd/system/sherlook-heal.service <<UNIT
 [Unit]
-Description=Sherlook v6.2.5 Continuous Tor Node Health and IP Auto-Heal
+Description=Sherlook v6.2.6 Continuous Tor Node Health and IP Auto-Heal
 After=network-online.target
 Wants=network-online.target
 
@@ -64,15 +62,20 @@ cat > /etc/cron.d/sherlook_watchdog <<CRON
 CRON
 chmod 644 /etc/cron.d/sherlook_watchdog
 
+systemctl stop tor 2>/dev/null || true
+systemctl disable tor 2>/dev/null || true
 systemctl daemon-reload
-systemctl enable sherlook-heal.service
+systemctl enable --now sherlook-heal.service
 systemctl restart cron 2>/dev/null || true
 
-# Initial fetch/patch: this also guarantees the new logo/version is active immediately.
-SHERLOOK_FORCE_UPDATE=1 "$TARGET" --refresh
-systemctl restart sherlook-heal.service
+# Prime the pinned base-engine cache and verify the final patched engine before reporting success.
+"$TARGET" --refresh
+bash -n "$TARGET"
+chmod 600 "$BASE_DIR/nexatis_panel.conf" 2>/dev/null || true
+chmod 600 "$BASE_DIR/panel_node_map.json" 2>/dev/null || true
 
 echo "[+] Sherlook v$VERSION installed successfully."
 echo "[+] Engine: $TARGET"
+echo "[+] Installer: $INSTALLER_TARGET"
 echo "[+] Service: sherlook-heal.service"
-echo "[+] New dynamic logo/version: V $VERSION"
+echo "[+] Update restart mode: systemd --no-block"
