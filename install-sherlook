@@ -1,43 +1,121 @@
 #!/usr/bin/env bash
-# Sherlook Engine Installer v6.3.2
+# Sherlook Engine Installer v6.3.3
+# GitHub-ready installer for SherlookHolmz/multi.
 set -euo pipefail
-RED='\033[1;31m'; GREEN='\033[1;32m'; YELLOW='\033[1;33m'; CYAN='\033[1;36m'; WHITE='\033[1;37m'; NC='\033[0m'
+
+RED='\033[1;31m'; GREEN='\033[1;32m'; YELLOW='\033[1;33m'
+CYAN='\033[1;36m'; WHITE='\033[1;37m'; NC='\033[0m'
+
 OWNER_REPO="SherlookHolmz/multi"
 BRANCH="main"
 RAW_BASE="https://raw.githubusercontent.com/$OWNER_REPO"
 API_BASE="https://api.github.com/repos/$OWNER_REPO"
+
 INSTALL_PATH="/usr/local/bin/sherlook"
 BASE_DIR="/etc/tor/sherlook_nodes"
 DATA_DIR="/var/lib/tor/sherlook_nodes"
-VERSION="6.3.2"
-check_root(){ [ "$EUID" -eq 0 ] || { echo -e "${RED}[!] Run as root.${NC}"; exit 1; }; }
-resolve_commit(){ curl -4 -fsSL --connect-timeout 10 --max-time 30 "$API_BASE/commits/$BRANCH" | jq -r '.sha // empty'; }
-main(){
-  check_root; umask 077
-  echo -e "${CYAN}[*] Installing Sherlook v$VERSION from an exact Git commit...${NC}"
-  apt-get update -qq
-  DEBIAN_FRONTEND=noninteractive apt-get install -y tor tor-geoipdb obfs4proxy curl jq openssl cron ca-certificates util-linux
-  systemctl stop tor 2>/dev/null || true; systemctl disable tor 2>/dev/null || true
-  mkdir -p "$BASE_DIR" "$DATA_DIR" /root/.sherlook
-  chown -R debian-tor:debian-tor "$DATA_DIR" 2>/dev/null || true
-  local commit tmp patched
-  commit=$(resolve_commit)
-  [[ "$commit" =~ ^[0-9a-f]{40}$ ]] || { echo -e "${RED}[!] Could not resolve current main commit.${NC}"; exit 1; }
-  tmp=$(mktemp /tmp/sherlook-install.XXXXXX)
-  patched=$(mktemp /tmp/sherlook-patched.XXXXXX)
-  trap 'rm -f "$tmp" "$patched"' EXIT
-  curl -4 -fsSL --connect-timeout 10 --max-time 90 -o "$tmp" "$RAW_BASE/$commit/sherlook.sh"
-  bash -n "$tmp"
-  grep -q 'SHERLOOK_VERSION="6.3.2"' "$tmp" || { echo -e "${RED}[!] Remote engine is not v6.3.2.${NC}"; exit 1; }
-  sed "s/^PINNED_COMMIT=\"__INSTALLER_RESOLVES__\"/PINNED_COMMIT=\"$commit\"/" "$tmp" > "$patched"
-  bash -n "$patched"
-  install -m 755 "$patched" "$INSTALL_PATH.new"; mv -f "$INSTALL_PATH.new" "$INSTALL_PATH"
-  install -m 755 "$patched" /root/.sherlook/sherlook.sh
-  cat > /etc/systemd/system/sherlook-heal.service <<UNIT
+VERSION="6.3.3"
+
+check_root() {
+    [ "$EUID" -eq 0 ] || {
+        echo -e "${RED}[!] Run as root.${NC}"
+        exit 1
+    }
+}
+
+need_cmd() {
+    command -v "$1" >/dev/null 2>&1 || {
+        echo -e "${RED}[!] Required command is missing: $1${NC}"
+        return 1
+    }
+}
+
+resolve_commit() {
+    curl -4 -fsSL \
+        --connect-timeout 10 \
+        --max-time 30 \
+        -H 'Accept: application/vnd.github+json' \
+        "$API_BASE/commits/$BRANCH" |
+        jq -r '.sha // empty'
+}
+
+main() {
+    check_root
+    umask 077
+
+    echo -e "${CYAN}[*] Installing Sherlook v$VERSION from an exact Git commit...${NC}"
+
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update -qq
+    apt-get install -y \
+        tor tor-geoipdb obfs4proxy curl jq openssl cron ca-certificates \
+        util-linux psmisc
+
+    need_cmd tor
+    need_cmd curl
+    need_cmd jq
+    need_cmd install
+    need_cmd flock
+    need_cmd timeout
+    need_cmd pgrep
+    need_cmd pkill
+
+    systemctl stop sherlook-heal.service 2>/dev/null || true
+    systemctl stop tor 2>/dev/null || true
+    systemctl disable tor 2>/dev/null || true
+
+    mkdir -p "$BASE_DIR" "$DATA_DIR" /root/.sherlook
+    chown -R debian-tor:debian-tor "$DATA_DIR" 2>/dev/null || true
+
+    local commit tmp patched backup
+    commit=$(resolve_commit)
+    [[ "$commit" =~ ^[0-9a-f]{40}$ ]] || {
+        echo -e "${RED}[!] Could not resolve $OWNER_REPO@$BRANCH to a full Git commit.${NC}"
+        exit 1
+    }
+
+    tmp=$(mktemp /tmp/sherlook-install.XXXXXX)
+    patched=$(mktemp /tmp/sherlook-patched.XXXXXX)
+    trap 'rm -f "$tmp" "$patched"' EXIT
+
+    echo -e "${CYAN}[*] Resolved commit: ${WHITE}$commit${NC}"
+    curl -4 -fsSL \
+        --connect-timeout 10 \
+        --max-time 90 \
+        -o "$tmp" \
+        "$RAW_BASE/$commit/sherlook.sh"
+
+    bash -n "$tmp"
+    grep -q '^SHERLOOK_VERSION="6\.3\.3"$' "$tmp" || {
+        echo -e "${RED}[!] Remote engine version mismatch; expected $VERSION.${NC}"
+        exit 1
+    }
+
+    sed "s/^PINNED_COMMIT=\"__INSTALLER_RESOLVES__\"/PINNED_COMMIT=\"$commit\"/" \
+        "$tmp" > "$patched"
+
+    bash -n "$patched"
+    grep -q "^PINNED_COMMIT=\"$commit\"$" "$patched" || {
+        echo -e "${RED}[!] Failed to embed the resolved commit pin.${NC}"
+        exit 1
+    }
+
+    backup="$BASE_DIR/sherlook.sh.bak.$(date +%Y%m%d_%H%M%S)"
+    if [ -f "$INSTALL_PATH" ]; then
+        cp -a "$INSTALL_PATH" "$backup"
+        echo -e "${YELLOW}[*] Existing installation backed up to $backup${NC}"
+    fi
+
+    install -m 755 "$patched" "$INSTALL_PATH.new"
+    mv -f "$INSTALL_PATH.new" "$INSTALL_PATH"
+    install -m 755 "$patched" /root/.sherlook/sherlook.sh
+
+    cat > /etc/systemd/system/sherlook-heal.service <<UNIT
 [Unit]
 Description=Sherlook Continuous Tor Node Health and IP Auto-Heal
 After=network-online.target
 Wants=network-online.target
+
 [Service]
 Type=simple
 ExecStart=$INSTALL_PATH --auto-heal-daemon
@@ -46,15 +124,30 @@ RestartSec=2
 User=root
 MemoryMax=256M
 NoNewPrivileges=false
+
 [Install]
 WantedBy=multi-user.target
 UNIT
-  systemctl daemon-reload
-  systemctl enable --now sherlook-heal.service
-  printf '%s\n' '*/15 * * * * root systemctl is-active --quiet sherlook-heal.service || systemctl restart sherlook-heal.service' > /etc/cron.d/sherlook_watchdog
-  chmod 644 /etc/cron.d/sherlook_watchdog
-  systemctl restart cron 2>/dev/null || true
-  echo -e "${GREEN}[+] Installed v$VERSION pinned to $commit${NC}"
-  echo -e "${GREEN}[+] obfs4proxy installed and bridge support available.${NC}"
+
+    systemctl daemon-reload
+    systemctl enable --now sherlook-heal.service
+
+    cat > /etc/cron.d/sherlook_watchdog <<'CRON'
+*/15 * * * * root systemctl is-active --quiet sherlook-heal.service || systemctl restart sherlook-heal.service
+CRON
+    chmod 644 /etc/cron.d/sherlook_watchdog
+    systemctl restart cron 2>/dev/null || true
+
+    local installed_version
+    installed_version=$("$INSTALL_PATH" --version 2>/dev/null || true)
+    [ "$installed_version" = "$VERSION" ] || {
+        echo -e "${RED}[!] Installed engine self-check failed: got '$installed_version'.${NC}"
+        exit 1
+    }
+
+    echo -e "${GREEN}[+] Installed Sherlook v$VERSION${NC}"
+    echo -e "${GREEN}[+] Pinned commit: $commit${NC}"
+    echo -e "${GREEN}[+] Auto-heal service is active.${NC}"
 }
+
 main "$@"
