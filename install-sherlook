@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Sherlook Engine Installer v6.4.0
+# Sherlook Engine Installer v6.4.1
 # GitHub-ready installer for SherlookHolmz/multi.
 set -euo pipefail
 
@@ -14,7 +14,7 @@ API_BASE="https://api.github.com/repos/$OWNER_REPO"
 INSTALL_PATH="/usr/local/bin/sherlook"
 BASE_DIR="/etc/tor/sherlook_nodes"
 DATA_DIR="/var/lib/tor/sherlook_nodes"
-VERSION="6.4.0"
+VERSION="6.4.1"
 
 check_root() {
     [ "$EUID" -eq 0 ] || {
@@ -87,7 +87,7 @@ main() {
         "$RAW_BASE/$commit/sherlook.sh"
 
     bash -n "$tmp"
-    grep -q '^SHERLOOK_VERSION="6\.4\.0"$' "$tmp" || {
+    grep -q '^SHERLOOK_VERSION="6\.4\.1"$' "$tmp" || {
         echo -e "${RED}[!] Remote engine version mismatch; expected $VERSION.${NC}"
         exit 1
     }
