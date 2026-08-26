@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Sherlook Automate Engine v6.4.0 (Nexatis API Edition)
-# Bugfix release: preserves the existing engine/UI while fixing torrc validation and in-place updates
+# Bugfix release: stable Tor routing, IP rotation, live status, bulk selection and in-place updates
 
 # ================= COLORS =================
 RED='\033[1;31m'
@@ -315,9 +315,9 @@ fallback_or_retry_deploy() {
 }
 
 validate_node_ip() {
-    local ip="$1" expected="$2"
+    local ip="$1" expected="$2" visual="${3:-0}"
     local result bad actual reason seen
-    result=$(check_ip_quality "$ip" "$expected")
+    result=$(check_ip_quality "$ip" "$expected" "$visual")
     IFS='|' read -r bad actual reason seen <<< "$result"
     printf '%s|%s|%s|%s\n' "$bad" "$actual" "$reason" "$seen"
 }
@@ -632,13 +632,21 @@ node_has_record() {
 check_ip_quality() {
     local ip="$1"
     local expected_cc="${2^^}"
+    local visual="${3:-0}"
     local tmpdir
     tmpdir=$(mktemp -d /tmp/sherlook_geo.XXXXXX) || { echo "1||GEOIP_UNAVAILABLE|"; return; }
 
     curl -4 -sS --connect-timeout 3 --max-time 6 "https://api.ipapi.is/?q=$ip" >"$tmpdir/a" 2>/dev/null & local p1=$!
     curl -4 -sS --connect-timeout 3 --max-time 6 "https://ipwho.is/$ip" >"$tmpdir/b" 2>/dev/null & local p2=$!
     curl -4 -sS --connect-timeout 3 --max-time 6 "https://ipapi.co/$ip/json/" >"$tmpdir/c" 2>/dev/null & local p3=$!
+    if [ "$visual" = "1" ]; then
+        while kill -0 "$p1" 2>/dev/null || kill -0 "$p2" 2>/dev/null || kill -0 "$p3" 2>/dev/null; do
+            ui_spin_frame "Verifying country / IP ${ip} (3 GeoIP sources)"
+            sleep 0.12
+        done
+    fi
     wait "$p1" "$p2" "$p3" 2>/dev/null || true
+    [ "$visual" = "1" ] && printf '\r\033[K' >&2
 
     local api1 api2 api3 cc1 cc2 cc3
     api1=$(cat "$tmpdir/a" 2>/dev/null || true)
@@ -1146,6 +1154,79 @@ panel_delete_node_ids() {
 
 # ================= UI FUNCTIONS =================
 
+UI_SPINNER_INDEX=0
+UI_SPINNER_FRAMES=('⠋' '⠙' '⠹' '⠸' '⠼' '⠴' '⠦' '⠧' '⠇' '⠏')
+
+ui_spin_frame() {
+    local label="${1:-Working}"
+    local frame="${UI_SPINNER_FRAMES[$UI_SPINNER_INDEX]}"
+    UI_SPINNER_INDEX=$(( (UI_SPINNER_INDEX + 1) % ${#UI_SPINNER_FRAMES[@]} ))
+    printf "\r\033[K${CYAN}[*] %s %s${NC}" "$frame" "$label" >&2
+}
+
+probe_public_ip() {
+    local out_port="$1" tmp value
+    tmp=$(mktemp /tmp/sherlook-ip.XXXXXX) || return 1
+    curl -4 -sS --socks5-hostname "127.0.0.1:${out_port}" \
+        https://api.ipify.org --connect-timeout 5 --max-time 12 >"$tmp" 2>/dev/null &
+    local pid=$!
+    local i=0
+    while kill -0 "$pid" 2>/dev/null; do
+        ui_spin_frame "Checking public IP via SOCKS ${out_port}"
+        sleep 0.12
+        i=$((i+1))
+    done
+    wait "$pid" 2>/dev/null || true
+    value=$(tr -d '\0\r\n' <"$tmp" 2>/dev/null || true)
+    rm -f "$tmp"
+    printf '\r\033[K' >&2
+    printf '%s\n' "$value"
+}
+
+parse_node_selection() {
+    # Supports: 2-4,5,9,12,43 ; 3,5,9,12,43 ; 01,05,09 ; mixed ranges.
+    local input="$1" token first last n idx swap
+    local -a result=() tokens=()
+    declare -A seen=()
+    input="${input// /}"
+    input="${input//;/,}"
+    input="${input//–/-}"
+    input="${input//—/-}"
+    IFS=',' read -ra tokens <<< "$input"
+
+    for token in "${tokens[@]}"; do
+        [ -n "$token" ] || continue
+        if [[ "$token" =~ ^([0-9]+)-([0-9]+)$ ]]; then
+            first=$((10#${BASH_REMATCH[1]}))
+            last=$((10#${BASH_REMATCH[2]}))
+            if (( first > last )); then
+                swap="$first"; first="$last"; last="$swap"
+            fi
+            for ((n=first; n<=last; n++)); do
+                (( n >= 1 && n <= 83 )) || continue
+                idx=$(printf '%02d' "$n")
+                if [[ -n "${NODES[$idx]:-}" && -z "${seen[$idx]:-}" ]]; then
+                    result+=("$idx")
+                    seen[$idx]=1
+                fi
+            done
+        elif [[ "$token" =~ ^[0-9]+$ ]]; then
+            n=$((10#$token))
+            (( n >= 1 && n <= 83 )) || continue
+            idx=$(printf '%02d' "$n")
+            if [[ -n "${NODES[$idx]:-}" && -z "${seen[$idx]:-}" ]]; then
+                result+=("$idx")
+                seen[$idx]=1
+            fi
+        else
+            echo -e "${YELLOW}[!] Invalid selection token: ${token}${NC}" >&2
+        fi
+    done
+    if [ "${#result[@]}" -gt 0 ]; then
+        printf '%s\n' "${result[@]}"
+    fi
+}
+
 draw_header() {
     clear
     echo -e "${MAGENTA} ╔════════════════════════════════════════════════════════╗${NC}"
@@ -1157,6 +1238,9 @@ draw_header() {
     echo -e "${MAGENTA} ║${CYAN}   ╚══════╝╚═╝  ╚═╝╚══════╝╚═╝  ╚═╝╚══════╝ ╚═════╝  ╚═════╝ ╚═╝  ╚═╝${MAGENTA} ║${NC}"
     echo -e "${MAGENTA} ║${YELLOW}          A U T O M A T E   E N G I N E   V 6 . 4 . 0                   ${MAGENTA}║${NC}"
     echo -e "${MAGENTA} ╚════════════════════════════════════════════════════════╝${NC}"
+    local live_frame="${UI_SPINNER_FRAMES[$UI_SPINNER_INDEX]}"
+    UI_SPINNER_INDEX=$(( (UI_SPINNER_INDEX + 1) % ${#UI_SPINNER_FRAMES[@]} ))
+    echo -e " ${CYAN}${live_frame}${NC} ${WHITE}Sherlook 6.4.0${NC} ${YELLOW}|${NC} Live Tor Engine ${CYAN}•${NC} country/IP verification ${GREEN}●${NC}"
     echo ""
 }
 
@@ -1168,7 +1252,7 @@ draw_progress() {
         for ((j=1; j<=i; j++)); do printf "█"; done
         for ((j=i+1; j<=20; j++)); do printf " "; done
         printf "${MAGENTA}] ${YELLOW}%3d%%${NC}" "$percent"
-        sleep 0.05
+        sleep 0.07
     done
     echo ""
 }
@@ -1217,6 +1301,10 @@ EOF
     local fallback_mode=0
     local fallback_index=0
     local fallback_candidates_arr=()
+    local same_rejected_ip_limit=2
+    local route_stuck=0
+    local just_entered_fallback=0
+    declare -A rejected_ip_counts=()
     mapfile -t fallback_candidates_arr < <(fallback_candidates "$code")
 
     while true; do
@@ -1254,19 +1342,21 @@ EOF
         local newnym_tries=0
         local last_ip=""
         local country_failures=0
+        route_stuck=0
+        rejected_ip_counts=()
 
         if [ "$tor_start_failed" -eq 0 ]; then
             while [ "$total_attempts" -lt "$attempt_limit" ]; do
                 total_attempts=$((total_attempts+1))
-            local public_ip
-            public_ip=$(curl -4 -sS --socks5-hostname 127.0.0.1:"$out_port" https://api.ipify.org --connect-timeout 5 --max-time 12 2>/dev/null | tr -d '\0\r\n' || true)
+                local public_ip
+                public_ip=$(probe_public_ip "$out_port" || true)
 
             if [ -z "$public_ip" ] || ! is_valid_ipv4 "$public_ip"; then
                 echo -e "${CYAN}[*] Waiting for Tor connection (Attempt $total_attempts/$attempt_limit)...${NC}"
             elif [ "$fallback_mode" -eq 1 ]; then
                 echo -e "${CYAN}[*] Verifying fallback IP ${MAGENTA}$public_ip${CYAN} against GeoIP sources for ${WHITE}$route_code${WHITE}...${NC}"
                 local fb_result fb_bad fb_actual fb_reason fb_seen
-                fb_result=$(check_ip_quality "$public_ip" "$route_code")
+                fb_result=$(check_ip_quality "$public_ip" "$route_code" 1)
                 IFS='|' read -r fb_bad fb_actual fb_reason fb_seen <<< "$fb_result"
                 if [ "$fb_bad" = "0" ]; then
                     printf '%s\n' "$public_ip" > "$ip_file"
@@ -1280,10 +1370,18 @@ EOF
                 fb_display_ip=$(ip_display_range "$public_ip")
                 echo -e "${RED}[-] Rejected fallback IP range ${fb_display_ip}: ${fb_reason} | detected=${fb_seen:-unknown} | expected=${route_code}${NC}"
                 append_bad_ip "$bad_file" "$public_ip"
+                rejected_ip_counts["$public_ip"]=$(( ${rejected_ip_counts["$public_ip"]:-0} + 1 ))
+                if [ "${rejected_ip_counts[$public_ip]}" -ge "$same_rejected_ip_limit" ]; then
+                    echo -e "${YELLOW}[!] ${public_ip} was rejected ${rejected_ip_counts[$public_ip]} times on fallback route ${route_code}. Moving on.${NC}"
+                    route_stuck=1
+                    stop_tor_node "$code" "$out_port"
+                    sleep 1
+                    break
+                fi
             else
                 echo -e "${CYAN}[*] Verifying ${MAGENTA}$public_ip${CYAN} against GeoIP sources for ${WHITE}$route_code${CYAN}...${NC}"
                 local result is_bad actual_cc reason seen_ccs
-                result=$(validate_node_ip "$public_ip" "$route_code")
+                result=$(validate_node_ip "$public_ip" "$route_code" 1)
                 IFS='|' read -r is_bad actual_cc reason seen_ccs <<< "$result"
 
                 if [ "$is_bad" = "0" ]; then
@@ -1300,6 +1398,20 @@ EOF
                 display_ip=$(ip_display_range "$public_ip")
                 echo -e "${RED}[-] Rejected IP range ${display_ip}: ${reason} | detected=${seen_ccs:-unknown} | expected=${route_code}${NC}"
                 append_bad_ip "$bad_file" "$public_ip"
+                rejected_ip_counts["$public_ip"]=$(( ${rejected_ip_counts["$public_ip"]:-0} + 1 ))
+                if [ "${rejected_ip_counts[$public_ip]}" -ge "$same_rejected_ip_limit" ]; then
+                    echo -e "${YELLOW}[!] ${public_ip} was rejected ${rejected_ip_counts[$public_ip]} times on route ${route_code}. It will NOT be tested again on this route.${NC}"
+                    echo -e "${CYAN}    > Forcing a fresh Tor instance / next route instead of looping on the same IP.${NC}"
+                    route_stuck=1
+                    stop_tor_node "$code" "$out_port"
+                    sleep 1
+                    if [ "$fallback_mode" -eq 0 ]; then
+                        fallback_mode=1
+                        fallback_index=0
+                        just_entered_fallback=1
+                    fi
+                    break
+                fi
 
                 # IMPORTANT: when the primary country produces 5 wrong-country IPs,
                 # do not wait for attempts 6..20. Ask immediately whether to keep
@@ -1317,6 +1429,7 @@ EOF
                             *)
                                 fallback_mode=1
                                 fallback_index=0
+                                just_entered_fallback=1
                                 # Stop the current primary-country Tor process before
                                 # selecting the first fallback route. No more IP checks
                                 # are performed for the primary route in this cycle.
@@ -1335,34 +1448,33 @@ EOF
             fi
 
             if [ "$total_attempts" -lt "$attempt_limit" ]; then
-                if [ "$public_ip" = "$last_ip" ]; then
-                    newnym_tries=$MAX_NEWNYM_TRIES
-                fi
                 last_ip="$public_ip"
-
-                if [ "$newnym_tries" -lt "$MAX_NEWNYM_TRIES" ]; then
-                    echo -e "${CYAN}    > Requesting a new circuit (NEWNYM)...${NC}"
-                    if send_newnym "$control_port" "$ctrl_pass"; then
-                        newnym_tries=$((newnym_tries+1))
-                        sleep 6
-                    else
-                        echo -e "${YELLOW}    > ControlPort/NEWNYM unavailable; rebuilding this Tor instance instead.${NC}"
-                        stop_tor_node "$code" "$out_port"
-                        sleep 1
-                        run_tor_node "$conf_file" || true
-                        sleep 3
-                        newnym_tries=0
-                    fi
+                echo -e "${YELLOW}    > Rotating the Tor instance after rejected country/IP validation...${NC}"
+                stop_tor_node "$code" "$out_port"
+                sleep 1
+                if run_tor_node "$conf_file"; then
+                    sleep 2
                 else
-                    echo -e "${YELLOW}    > Rebuilding Tor instance after repeated validation failures...${NC}"
-                    stop_tor_node "$code" "$out_port"
-                    sleep 1
-                    run_tor_node "$conf_file" || true
-                    sleep 3
-                    newnym_tries=0
+                    echo -e "${RED}    > Tor restart failed; the current route will be abandoned instead of retrying the same IP.${NC}"
+                    route_stuck=1
+                    if [ "$fallback_mode" -eq 0 ]; then
+                        fallback_mode=1
+                        fallback_index=0
+                    fi
+                    break
                 fi
             fi
             done
+        fi
+
+        # If the route got stuck on a repeated rejected IP, never ask the old
+        # 20-attempt prompt again: move directly to the next route.
+        if [ "$route_stuck" -eq 1 ]; then
+            if [ "$fallback_mode" -eq 0 ]; then
+                fallback_mode=1
+                fallback_index=0
+                just_entered_fallback=1
+            fi
         fi
 
         # If the 5-wrong-IP action already switched to fallback, do NOT ask the
@@ -1393,9 +1505,14 @@ EOF
 
             fallback_mode=1
             fallback_index=0
+            just_entered_fallback=1
         else
             # Every fallback route gets exactly 5 attempts, then advances.
-            fallback_index=$((fallback_index+1))
+            if [ "$just_entered_fallback" -eq 1 ]; then
+                just_entered_fallback=0
+            else
+                fallback_index=$((fallback_index+1))
+            fi
         fi
 
         local next_route=""
@@ -1875,51 +1992,10 @@ bulk_add_nodes() {
             return
         fi
 
-        custom_list="${custom_list// /}"
-        custom_list="${custom_list//;/,}"
-
-        declare -a selected=()
-        declare -A seen=()
-
-        IFS=',' read -ra ADDR <<< "$custom_list"
-
-        for part in "${ADDR[@]}"; do
-            [[ -z "$part" ]] && continue
-
-            if [[ "$part" =~ ^([0-9]+)-([0-9]+)$ ]]; then
-                first="${BASH_REMATCH[1]}"
-                last="${BASH_REMATCH[2]}"
-
-                if (( first > last )); then
-                    tmp="$first"
-                    first="$last"
-                    last="$tmp"
-                fi
-
-                for ((n=first; n<=last; n++)); do
-                    p_idx=$(printf "%02d" "$n")
-
-                    if [[ -n "${NODES[$p_idx]:-}" && -z "${seen[$p_idx]:-}" ]]; then
-                        selected+=("$p_idx")
-                        seen[$p_idx]=1
-                    fi
-                done
-
-            elif [[ "$part" =~ ^[0-9]+$ ]]; then
-                p_idx=$(printf "%02d" "$part")
-
-                if [[ -n "${NODES[$p_idx]:-}" && -z "${seen[$p_idx]:-}" ]]; then
-                    selected+=("$p_idx")
-                    seen[$p_idx]=1
-                fi
-
-            else
-                echo -e "${YELLOW}[!] Invalid selection: $part${NC}"
-            fi
-        done
+        mapfile -t selected < <(parse_node_selection "$custom_list")
 
         if [ "${#selected[@]}" -eq 0 ]; then
-            echo -e "${RED}[!] No valid locations selected.${NC}"
+            echo -e "${RED}[!] No valid locations selected. Use examples: 2-4,5,9,12,43  OR  3,5,9,12,43${NC}"
             sleep 2
             return
         fi
@@ -2007,20 +2083,6 @@ view_active_nodes() {
 
 edit_delete_nodes() {
     check_root
-    parse_node_selection() {
-        local input="$1" token a b n idx; local -a result=(); declare -A seen=()
-        input="${input// /}"; input="${input//;/,}"; IFS=',' read -ra tokens <<< "$input"
-        for token in "${tokens[@]}"; do
-            [ -z "$token" ] && continue
-            if [[ "$token" =~ ^([0-9]+)-([0-9]+)$ ]]; then
-                a=$((10#${BASH_REMATCH[1]})); b=$((10#${BASH_REMATCH[2]})); ((a>b)) && { n=$a; a=$b; b=$n; }
-                for ((n=a;n<=b;n++)); do idx=$(printf '%02d' "$n"); [[ -n "${NODES[$idx]:-}" && -z "${seen[$idx]:-}" ]] && result+=("$idx") && seen[$idx]=1; done
-            elif [[ "$token" =~ ^[0-9]+$ ]]; then
-                idx=$(printf '%02d' "$((10#$token))"); [[ -n "${NODES[$idx]:-}" && -z "${seen[$idx]:-}" ]] && result+=("$idx") && seen[$idx]=1
-            fi
-        done
-        printf '%s\n' "${result[@]}"
-    }
     delete_local_ids() { local idx code name out_port; for idx in "$@"; do IFS=':' read -r code name out_port <<< "${NODES[$idx]}"; pkill -9 -f "node_${code}_${out_port}\.conf" 2>/dev/null || true; rm -f "$BASE_DIR/node_${code}_${out_port}.conf"; rm -rf "$DATA_DIR/${code}_${out_port}"; done; }
     repair_ids() { compute_effective_parallel; local max_jobs=$EFFECTIVE_PARALLEL jobs=0; local -a pids=(); local idx code name out_port; for idx in "$@"; do IFS=':' read -r code name out_port <<< "${NODES[$idx]}"; [ -f "$BASE_DIR/node_${code}_${out_port}.conf" ] || continue; rotate_one_node "$code" "$name" "$out_port" 0 & pids+=("$!"); jobs=$((jobs+1)); if ((jobs>=max_jobs)); then wait "${pids[0]}" 2>/dev/null || true; pids=("${pids[@]:1}"); jobs=$((jobs-1)); fi; done; for pid in "${pids[@]}"; do wait "$pid" 2>/dev/null || true; done; }
     while true; do
@@ -2172,35 +2234,22 @@ panel_batch_create() {
     if [[ -z "$user_selection" || "${user_selection,,}" == "all" ]]; then
         selected_nodes=("${installed[@]}")
     else
-        IFS=',' read -ra SEL_ADDR <<< "$user_selection"
-        for s in "${SEL_ADDR[@]}"; do
-            local clean_s=$(echo "$s" | sed 's/^0*//' | tr -d ' ')
-            if [ -n "$clean_s" ]; then
-                local p_idx=$(printf "%02d" "$clean_s" 2>/dev/null)
-                local is_installed=0
-                for inst_node in "${installed[@]}"; do
-                    if [[ "$inst_node" == "$p_idx" ]]; then
-                        is_installed=1
-                        break
-                    fi
-                done
-
-                if [[ $is_installed -eq 1 ]]; then
-                    local is_duplicate=0
-                    for sel_node in "${selected_nodes[@]}"; do
-                        if [[ "$sel_node" == "$p_idx" ]]; then
-                            is_duplicate=1
-                            break
-                        fi
-                    done
-                    if [[ $is_duplicate -eq 0 ]]; then
-                        selected_nodes+=("$p_idx")
-                    fi
-                else
-                    echo -e "${YELLOW}[!] Node ID $p_idx is not installed or invalid. Skipping...${NC}"
+        local parsed_id
+        while IFS= read -r parsed_id; do
+            [ -n "$parsed_id" ] || continue
+            local is_installed=0
+            for inst_node in "${installed[@]}"; do
+                if [[ "$inst_node" == "$parsed_id" ]]; then
+                    is_installed=1
+                    break
                 fi
+            done
+            if [[ "$is_installed" -eq 1 ]]; then
+                selected_nodes+=("$parsed_id")
+            else
+                echo -e "${YELLOW}[!] Node ID $parsed_id is not installed or invalid. Skipping...${NC}"
             fi
-        done
+        done < <(parse_node_selection "$user_selection")
     fi
 
     if [ ${#selected_nodes[@]} -eq 0 ]; then
