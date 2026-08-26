@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Sherlook Automate Engine v6.4.0 (Nexatis API Edition)
+# Sherlook Automate Engine v6.4.1 (Nexatis API Edition)
 # Bugfix release: stable Tor routing, IP rotation, live status, bulk selection and in-place updates
 
 # ================= COLORS =================
@@ -22,7 +22,7 @@ RAW_ENGINE_URL="$RAW_BASE/sherlook.sh"
 RAW_INSTALLER_URL="$RAW_BASE/install.sh"
 # Installer resolves this placeholder to the exact commit installed.
 PINNED_COMMIT="__INSTALLER_RESOLVES__"
-SHERLOOK_VERSION="6.4.0"
+SHERLOOK_VERSION="6.4.1"
 LOCATION_CACHE="$DATA_DIR/onionoo_exit_countries.cache"
 LOCATION_CATALOG="$DATA_DIR/location_catalog.tsv"
 LOCATION_CACHE_TTL=21600
@@ -715,25 +715,6 @@ check_ip_quality() {
     echo "${bad}|${actual_cc}|${reason}|${seen}"
 }
 
-send_newnym() {
-    # 6.4.0 deliberately keeps the primary torrc minimal. A node may have a
-    # legacy control.env, but NEWNYM is optional; callers must rebuild the
-    # instance when this function returns non-zero.
-    local control_port="${1:-}" pass="${2:-}" response
-    [ -n "$control_port" ] || return 1
-    exec 3<>"/dev/tcp/127.0.0.1/${control_port}" 2>/dev/null || return 1
-    printf 'AUTHENTICATE "%s"\r\n' "$pass" >&3 || { exec 3<&- 3>&-; return 1; }
-    response=$(timeout 3 cat <&3 2>/dev/null | head -n 5 || true)
-    if ! grep -q '^250 OK' <<< "$response"; then
-        exec 3<&- 3>&-
-        return 1
-    fi
-    printf 'SIGNAL NEWNYM\r\nQUIT\r\n' >&3 || { exec 3<&- 3>&-; return 1; }
-    response=$(timeout 3 cat <&3 2>/dev/null | head -n 5 || true)
-    exec 3<&- 3>&-
-    grep -q '^250 OK' <<< "$response"
-}
-
 write_node_conf() {
     local conf_file="$1" out_port="$2" _control_port="$3" _hashed_pass="$4" inst_data_dir="$5" code="$6"
     local route_code
@@ -863,7 +844,7 @@ if [ "${1:-}" = "--auto-heal-daemon" ]; then
 fi
 
 
-# ================= V6.4.0 HEALTH / BRIDGE / PANEL SAFETY =================
+# ================= V6.4.1 HEALTH / BRIDGE / PANEL SAFETY =================
 
 node_dir() { printf '%s\n' "$DATA_DIR/${1}_${2}"; }
 node_index_by_code() {
@@ -1240,7 +1221,7 @@ draw_header() {
     echo -e "${MAGENTA} ╚════════════════════════════════════════════════════════╝${NC}"
     local live_frame="${UI_SPINNER_FRAMES[$UI_SPINNER_INDEX]}"
     UI_SPINNER_INDEX=$(( (UI_SPINNER_INDEX + 1) % ${#UI_SPINNER_FRAMES[@]} ))
-    echo -e " ${CYAN}${live_frame}${NC} ${WHITE}Sherlook 6.4.0${NC} ${YELLOW}|${NC} Live Tor Engine ${CYAN}•${NC} country/IP verification ${GREEN}●${NC}"
+    echo -e " ${CYAN}${live_frame}${NC} ${WHITE}Sherlook 6.4.1${NC} ${YELLOW}|${NC} Live Tor Engine ${CYAN}•${NC} country/IP verification ${GREEN}●${NC}"
     echo ""
 }
 
@@ -1279,21 +1260,8 @@ deploy_node() {
         echo -e "${YELLOW}[!] Heads up: $name usually has very few Tor exit relays.${NC}"
     fi
 
-    local ctrl_pass hashed_pass control_port
-    if [ -f "$ctrl_file" ]; then
-        source "$ctrl_file" 2>/dev/null || true
-        ctrl_pass="$CTRL_PASS"; hashed_pass="$HASHED_PASS"; control_port="$CTRL_PORT"
-    else
-        ctrl_pass=$(openssl rand -hex 16)
-        hashed_pass=$(tor --hash-password "$ctrl_pass" 2>/dev/null | tail -n1)
-        control_port=$((out_port + 20000))
-        cat <<EOF > "$ctrl_file"
-CTRL_PASS="$ctrl_pass"
-HASHED_PASS='$hashed_pass'
-CTRL_PORT="$control_port"
-EOF
-        chmod 600 "$ctrl_file"
-    fi
+    # 6.4.1: no ControlPort is required for node operation or IP rotation.
+    # Keep an old control.env only as legacy data; it is never used to rotate a node.
 
     # Primary country gets the full 20-attempt budget. Each fallback route gets
     # its own independent 5-attempt budget. A fallback IP must still geolocate
@@ -1360,6 +1328,8 @@ EOF
                 IFS='|' read -r fb_bad fb_actual fb_reason fb_seen <<< "$fb_result"
                 if [ "$fb_bad" = "0" ]; then
                     printf '%s\n' "$public_ip" > "$ip_file"
+                    state_set "$code" "$out_port" ONLINE "$public_ip" 100 "VERIFIED:${fb_seen}"
+                    quarantine_clear "$code" "$out_port"
                     echo -e "${GREEN}[+] FALLBACK VERIFIED: $public_ip → label=$code/$name route=$route_code${NC}"
                     echo -e "${GREEN}[+] GeoIP sources: ${fb_seen}${NC}"
                     echo -e "${GREEN}[+] Online -> ${WHITE}$code - $name ${GREEN}($public_ip)${NC}\n"
@@ -1386,6 +1356,8 @@ EOF
 
                 if [ "$is_bad" = "0" ]; then
                     printf '%s\n' "$public_ip" > "$ip_file"
+                    state_set "$code" "$out_port" ONLINE "$public_ip" 100 "VERIFIED:${seen_ccs}"
+                    quarantine_clear "$code" "$out_port"
                     echo -e "${GREEN}[+] VERIFIED: $public_ip → label=$code/$name route=$route_code${NC}"
                     echo -e "${GREEN}[+] GeoIP sources: ${seen_ccs}${NC}"
                     echo -e "${GREEN}[+] Online -> ${WHITE}$code - $name ${GREEN}($public_ip)${NC}\n"
@@ -1563,94 +1535,88 @@ rotate_one_node_core() {
     local code="$1" name="$2" out_port="$3" silent="${4:-0}"
     local conf_file="$BASE_DIR/node_${code}_${out_port}.conf"
     local inst_data_dir="$DATA_DIR/${code}_${out_port}"
-    local ctrl_file="$inst_data_dir/control.env"
     local bad_file="$inst_data_dir/bad_exits.txt"
     local ip_file="$inst_data_dir/last_ip.txt"
-    [ -f "$conf_file" ] && [ -f "$ctrl_file" ] || return 2
+    [ -f "$conf_file" ] || return 2
 
-    source "$ctrl_file" 2>/dev/null || return 2
+    mkdir -p "$inst_data_dir"
+    touch "$bad_file"
     local old_ip=""
     [ -s "$ip_file" ] && old_ip=$(head -n1 "$ip_file" | tr -d '\r\n')
+    local expected_route="$(node_route_code "$code" "$out_port")"
     [ "$silent" = "1" ] || echo -e "${CYAN}🔄 $code - $name: changing IP...${NC}"
 
+    # 6.4.1: Do not depend on ControlPort/NEWNYM. Rebuild the exact Tor
+    # instance when a circuit/IP is unusable. This keeps the primary torrc
+    # minimal and fixes legacy nodes whose control.env points to a dead port.
+    local attempt=0 new_ip="" result bad actual reason seen
+    local same_ip_count=0
+    declare -A seen_ips=()
+    [ -n "$old_ip" ] && seen_ips["$old_ip"]=1
+
     if ! node_process_running "$code" "$out_port"; then
-        [ "$silent" = "1" ] || echo -e "${YELLOW}    > Tor process for $code is not running — starting it now...${NC}"
-        rm -f "$ip_file"
-        write_node_conf "$conf_file" "$out_port" "$CTRL_PORT" "$HASHED_PASS" "$inst_data_dir" "$code"
+        [ "$silent" = "1" ] || echo -e "${YELLOW}    > Tor process for $code is not running — rebuilding it now...${NC}"
+        stop_tor_node "$code" "$out_port"
         if ! run_tor_node "$conf_file"; then
-            [ "$silent" = "1" ] || echo -e "${RED}    > Tor failed to start; see $inst_data_dir/notices.log${NC}"
+            state_set "$code" "$out_port" DEAD "" 0 "TOR_START_FAILED"
             return 1
         fi
-        sleep 5
+        sleep 2
     fi
 
-    local attempt new_ip result bad actual reason seen
-    local expected_route="$(node_route_code "$code" "$out_port")"
-    local last_seen_ip="$old_ip"
-    local same_ip_count=0
+    while (( attempt < NODE_ROTATE_RETRIES )); do
+        attempt=$((attempt+1))
+        new_ip=$(get_node_ip "$out_port" || true)
 
-    # Attempt 1 is a real IP check immediately after Tor starts. NEWNYM is only
-    # used after an initial result, so startup time is never mistaken for retries.
-    for attempt in $(seq 1 "$NODE_ROTATE_RETRIES"); do
-        new_ip=$(get_node_ip "$out_port")
-
-        if is_valid_ipv4 "$new_ip"; then
-            if [ "$new_ip" = "$old_ip" ]; then
+        if ! is_valid_ipv4 "$new_ip"; then
+            [ "$silent" = "1" ] || echo -e "${YELLOW}  • $code no public IP yet (attempt $attempt/$NODE_ROTATE_RETRIES)${NC}"
+        else
+            if [[ -n "${seen_ips[$new_ip]:-}" ]]; then
                 same_ip_count=$((same_ip_count+1))
-                [ "$silent" = "1" ] || echo -e "${YELLOW}  • $code kept old IP $new_ip (attempt $attempt/$NODE_ROTATE_RETRIES)${NC}"
+                [ "$silent" = "1" ] || echo -e "${YELLOW}  • $code received a previously-seen IP $new_ip; forcing a new Tor instance (attempt $attempt/$NODE_ROTATE_RETRIES)${NC}"
             else
+                seen_ips["$new_ip"]=1
                 result=$(check_ip_quality "$new_ip" "$expected_route")
                 IFS='|' read -r bad actual reason seen <<< "$result"
+                if [ "$reason" = "GEOIP_UNAVAILABLE" ]; then
+                    printf '%s\n' "$new_ip" > "$ip_file"
+                    [ "$silent" = "1" ] || echo -e "${YELLOW}  • $code → $new_ip; GeoIP temporarily unavailable${NC}"
+                    state_set "$code" "$out_port" ONLINE_UNVERIFIED "$new_ip" 100 "GEOIP_UNAVAILABLE"
+                    return 0
+                fi
                 if [ "$bad" = "0" ]; then
                     printf '%s\n' "$new_ip" > "$ip_file"
                     [ "$silent" = "1" ] || echo -e "${GREEN}  ✓ $code → $new_ip (attempt $attempt/$NODE_ROTATE_RETRIES)${NC}"
+                    state_set "$code" "$out_port" ONLINE "$new_ip" 100 "VERIFIED:${seen}"
+                    quarantine_clear "$code" "$out_port"
                     return 0
                 fi
                 append_bad_ip "$bad_file" "$new_ip"
                 local display_new_ip
                 display_new_ip=$(ip_display_range "$new_ip")
                 [ "$silent" = "1" ] || echo -e "${RED}  ✗ $code rejected IP range $display_new_ip for route $expected_route: $reason (attempt $attempt/$NODE_ROTATE_RETRIES)${NC}"
-                same_ip_count=0
-            fi
-        else
-            [ "$silent" = "1" ] || echo -e "${YELLOW}  • $code no valid IP yet (attempt $attempt/$NODE_ROTATE_RETRIES)${NC}"
-        fi
-
-        # Change circuit after every failed validation. Rebuild Tor after repeated
-        # identical/no-useful circuits instead of waiting until all 20 attempts end.
-        if [ "$attempt" -lt "$NODE_ROTATE_RETRIES" ]; then
-            if [ "$same_ip_count" -ge 2 ] || ! is_valid_ipv4 "$new_ip" || [ "$new_ip" = "$last_seen_ip" ]; then
-                [ "$silent" = "1" ] || echo -e "${CYAN}    > Requesting a fresh Tor circuit (NEWNYM)...${NC}"
-                send_newnym "$CTRL_PORT" "$CTRL_PASS" || true
-                sleep 2
-            else
-                send_newnym "$CTRL_PORT" "$CTRL_PASS" || true
-                sleep 1
             fi
         fi
-        if is_valid_ipv4 "$new_ip"; then last_seen_ip="$new_ip"; fi
 
-        # Every 5 failed attempts perform a full rebuild while retaining the same
-        # 20-attempt budget. This gives dead nodes a genuine automatic recovery path.
-        if [ "$attempt" -lt "$NODE_ROTATE_RETRIES" ] && (( attempt % 5 == 0 )); then
-            [ "$silent" = "1" ] || echo -e "${YELLOW}    > ${code}: rebuilding Tor after $attempt failed validation attempts...${NC}"
-            if is_valid_ipv4 "$new_ip"; then append_bad_ip "$bad_file" "$new_ip"; fi
-            write_node_conf "$conf_file" "$out_port" "$CTRL_PORT" "$HASHED_PASS" "$inst_data_dir" "$code"
+        if (( attempt < NODE_ROTATE_RETRIES )); then
+            [ "$silent" = "1" ] || echo -e "${CYAN}    > Rebuilding Tor instance for $code to force a fresh circuit/IP...${NC}"
             stop_tor_node "$code" "$out_port"
             sleep 1
-            run_tor_node "$conf_file"
+            if ! run_tor_node "$conf_file"; then
+                state_set "$code" "$out_port" DEAD "" 0 "TOR_RESTART_FAILED"
+                [ "$silent" = "1" ] || echo -e "${RED}    > Tor restart failed; retrying with the same route is skipped until process recovers.${NC}"
+                sleep 1
+                continue
+            fi
             sleep 2
-            same_ip_count=0
         fi
     done
 
-    # The 20-attempt loop above already performs NEWNYM and periodic full rebuilds.
-    # Do not start a second hidden retry loop here; that used to make the retry count
-    # misleading and could make recovery appear to begin only on later attempts.
-
     rm -f "$ip_file"
+    state_set "$code" "$out_port" EXIT_GEOIP_FAIL "" 100 "NO_VERIFIED_NEW_IP"
+    quarantine_record_failure "$code" "$out_port" "NO_VERIFIED_NEW_IP"
     echo "$(date '+%Y-%m-%d %H:%M:%S') rotation failed for $code" >> "$inst_data_dir/heal_fail.log"
-    [ "$silent" = "1" ] || echo -e "${RED}  ✗ $code: no verified replacement IP found.${NC}"
+    [ "$silent" = "1" ] || echo -e "${RED}  ✗ $code: no verified replacement IP found after $NODE_ROTATE_RETRIES rebuild attempts.${NC}"
     return 1
 }
 
