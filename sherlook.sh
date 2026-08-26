@@ -470,8 +470,11 @@ run_tor_node() {
 }
 
 node_process_running() {
-    local code="$1" port="$2" pid_file pid args
+    local code="$1" port="$2" pid_file pid args pattern
     pid_file=$(node_pid_file "$code" "$port")
+    pattern="node_${code}_${port}\.conf"
+
+    # Preferred path for 6.4.x nodes: the PID written by run_tor_node().
     if [ -r "$pid_file" ]; then
         pid=$(tr -dc '0-9' < "$pid_file" 2>/dev/null || true)
         if [[ "$pid" =~ ^[0-9]+$ ]] && kill -0 "$pid" 2>/dev/null; then
@@ -480,6 +483,15 @@ node_process_running() {
                 return 0
             fi
         fi
+    fi
+
+    # Compatibility path for nodes created by 6.3.x / V4.5, whose PID file
+    # does not exist or was lost after an upgrade/reboot.
+    pid=$(pgrep -f -- "$pattern" | head -n1 || true)
+    if [[ "$pid" =~ ^[0-9]+$ ]] && kill -0 "$pid" 2>/dev/null; then
+        printf '%s\n' "$pid" > "$pid_file" 2>/dev/null || true
+        chmod 600 "$pid_file" 2>/dev/null || true
+        return 0
     fi
     return 1
 }
@@ -744,7 +756,7 @@ EOF
 }
 
 health_check_node() {
-    local code="$1" name="$2" out_port="$3" silent="${4:-1}"
+    local code="$1" name="$2" out_port="$3" silent="${4:-1}" repair="${5:-1}"
     local conf_file="$BASE_DIR/node_${code}_${out_port}.conf" inst_data_dir="$DATA_DIR/${code}_${out_port}" ip_file="$DATA_DIR/${code}_${out_port}/last_ip.txt"
     [ -f "$conf_file" ] || return 0
     if node_quarantine_active "$code" "$out_port"; then return 4; fi
@@ -752,32 +764,52 @@ health_check_node() {
     bootstrap_raw=$(bootstrap_status "$code" "$out_port" "$inst_data_dir"); bootstrap_pct=${bootstrap_raw%%|*}; bootstrap_tag=${bootstrap_raw#*|}
     if ! node_process_running "$code" "$out_port"; then
         state_set "$code" "$out_port" DEAD "" "$bootstrap_pct" "PROCESS_DOWN"
-        rotate_one_node "$code" "$name" "$out_port" "$silent"; local rc=$?
-        (( rc == 0 )) && quarantine_clear "$code" "$out_port" || quarantine_record_failure "$code" "$out_port" "PROCESS_DOWN"
-        return $rc
+        if [ "$repair" = "1" ]; then
+            rotate_one_node "$code" "$name" "$out_port" "$silent"; local rc=$?
+            (( rc == 0 )) && quarantine_clear "$code" "$out_port" || quarantine_record_failure "$code" "$out_port" "PROCESS_DOWN"
+            return $rc
+        fi
+        return 1
     fi
     current_ip=$(get_node_ip "$out_port")
     if ! is_valid_ipv4 "$current_ip"; then
         state_set "$code" "$out_port" "SOCKS_DEAD" "" "$bootstrap_pct" "SOCKS_UNREACHABLE"
-        rotate_one_node "$code" "$name" "$out_port" "$silent"; local rc=$?
-        (( rc == 0 )) && quarantine_clear "$code" "$out_port" || quarantine_record_failure "$code" "$out_port" "SOCKS_UNREACHABLE"
-        return $rc
+        if [ "$repair" = "1" ]; then
+            rotate_one_node "$code" "$name" "$out_port" "$silent"; local rc=$?
+            (( rc == 0 )) && quarantine_clear "$code" "$out_port" || quarantine_record_failure "$code" "$out_port" "SOCKS_UNREACHABLE"
+            return $rc
+        fi
+        return 1
     fi
     expected_route=$(node_route_code "$code" "$out_port")
     result=$(check_ip_quality "$current_ip" "$expected_route"); IFS='|' read -r bad actual reason seen <<< "$result"
+    # A live public IP is useful even when an external GeoIP provider is
+    # temporarily unavailable. Keep the IP visible and mark the node as
+    # ONLINE_UNVERIFIED instead of pretending that it is fully verified.
+    if [ "$reason" = "GEOIP_UNAVAILABLE" ]; then
+        printf '%s\n' "$current_ip" > "$ip_file"
+        quarantine_clear "$code" "$out_port"
+        [ "$bootstrap_pct" -lt 100 ] && bootstrap_pct=100
+        state_set "$code" "$out_port" ONLINE_UNVERIFIED "$current_ip" "$bootstrap_pct" "GEOIP_UNAVAILABLE"
+        return 2
+    fi
+
     if [ "$bad" != "0" ]; then
         state_set "$code" "$out_port" "EXIT_GEOIP_FAIL" "$current_ip" "$bootstrap_pct" "$reason"
-        rotate_one_node "$code" "$name" "$out_port" "$silent"; local rc=$?
-        (( rc == 0 )) && quarantine_clear "$code" "$out_port" || quarantine_record_failure "$code" "$out_port" "$reason"
-        return $rc
+        if [ "$repair" = "1" ]; then
+            rotate_one_node "$code" "$name" "$out_port" "$silent"; local rc=$?
+            (( rc == 0 )) && quarantine_clear "$code" "$out_port" || quarantine_record_failure "$code" "$out_port" "$reason"
+            return $rc
+        fi
+        return 1
     fi
     printf '%s\n' "$current_ip" > "$ip_file"
     quarantine_clear "$code" "$out_port"
-    if (( bootstrap_pct < 100 )); then
-        state_set "$code" "$out_port" "BOOTSTRAP(${bootstrap_pct}%)" "$current_ip" "$bootstrap_pct" "$bootstrap_tag"
-    else
-        state_set "$code" "$out_port" ONLINE "$current_ip" "$bootstrap_pct" "VERIFIED:${seen}"
-    fi
+    # A verified public IP through SOCKS proves a usable circuit. When the
+    # bootstrap log is unavailable (common after upgrading a legacy node),
+    # report it as operational rather than UNKNOWN.
+    [ "$bootstrap_pct" -lt 100 ] && bootstrap_pct=100
+    state_set "$code" "$out_port" ONLINE "$current_ip" "$bootstrap_pct" "VERIFIED:${seen}"
     return 0
 }
 
@@ -791,7 +823,7 @@ background_auto_heal() {
     for idx in "${ORDER[@]}"; do
         details="${NODES[$idx]}"; IFS=':' read -r code name out_port <<< "$details"
         [ -f "$BASE_DIR/node_${code}_${out_port}.conf" ] || continue
-        health_check_node "$code" "$name" "$out_port" 1 & pids+=("$!"); running=$((running+1))
+        health_check_node "$code" "$name" "$out_port" 1 1 & pids+=("$!"); running=$((running+1))
         if (( running >= EFFECTIVE_PARALLEL )); then
             wait "${pids[0]}" 2>/dev/null || true; pids=("${pids[@]:1}"); running=$((running-1))
         fi
@@ -908,16 +940,39 @@ ctrl_query() {
 }
 
 bootstrap_status() {
-    local code="$1" port="$2" inst_data_dir="$3" pass
-    local ctrl_file="$inst_data_dir/control.env"
-    [ -r "$ctrl_file" ] || { printf '0|NO_CONTROL_FILE'; return 0; }
-    # shellcheck disable=SC1090
-    source "$ctrl_file" 2>/dev/null || { printf '0|CONTROL_LOAD_FAIL'; return 0; }
-    local out progress tag
-    out=$(ctrl_query "$CTRL_PORT" "$CTRL_PASS" 'GETINFO status/bootstrap-phase' 4)
-    progress=$(printf '%s\n' "$out" | grep -oE 'PROGRESS=[0-9]+' | tail -n1 | cut -d= -f2)
-    tag=$(printf '%s\n' "$out" | grep -oE 'TAG=[^ ]+' | tail -n1 | cut -d= -f2)
-    progress=${progress:-0}; tag=${tag:-unknown}
+    local code="$1" port="$2" inst_data_dir="$3" log_file="$inst_data_dir/notices.log" ctrl_file="$inst_data_dir/control.env"
+    local progress=0 tag="not_started" line
+
+    # 6.4.x node torrc intentionally has no ControlPort. Prefer Tor's own
+    # bootstrap notices, which also work for legacy nodes that do not have
+    # control.env anymore.
+    if [ -r "$log_file" ]; then
+        line=$(grep -Eo 'Bootstrapped [0-9]+%[^$]*' "$log_file" 2>/dev/null | tail -n1 || true)
+        if [[ "$line" =~ Bootstrapped[[:space:]]+([0-9]+)% ]]; then
+            progress="${BASH_REMATCH[1]}"
+            tag="bootstrap"
+        fi
+        local last_reason
+        last_reason=$(grep -Ei 'WARN|ERR|failed|Unable|problem|connection|TLS|guard' "$log_file" 2>/dev/null | tail -n1 || true)
+        if [ "$progress" -lt 100 ] && [ -n "$last_reason" ]; then
+            tag=$(printf '%s' "$last_reason" | tr -s ' ' | cut -c1-90)
+        fi
+    fi
+
+    # Backward compatibility: legacy nodes that still have a control.env can
+    # provide a more precise bootstrap percentage when ControlPort answers.
+    if [ -r "$ctrl_file" ]; then
+        # shellcheck disable=SC1090
+        source "$ctrl_file" 2>/dev/null || true
+        if [ -n "${CTRL_PORT:-}" ] && [ -n "${CTRL_PASS:-}" ]; then
+            local out cp ct
+            out=$(ctrl_query "$CTRL_PORT" "$CTRL_PASS" 'GETINFO status/bootstrap-phase' 3)
+            cp=$(printf '%s\n' "$out" | grep -oE 'PROGRESS=[0-9]+' | tail -n1 | cut -d= -f2 || true)
+            ct=$(printf '%s\n' "$out" | grep -oE 'TAG=[^ ]+' | tail -n1 | cut -d= -f2 || true)
+            [[ "$cp" =~ ^[0-9]+$ ]] && progress="$cp"
+            [ -n "$ct" ] && tag="$ct"
+        fi
+    fi
     printf '%s|%s\n' "$progress" "$tag"
 }
 
@@ -1911,25 +1966,43 @@ bulk_add_nodes() {
 
 view_active_nodes() {
     check_root
-    while true; do
-        draw_header; sync_dynamic_locations
-        echo -e "${CYAN}» Option 6 - Active Nodes Monitor${NC}"
-        echo -e "${YELLOW}[*] Live network checks run in the background; this screen reads cached health state.${NC}\n"
-        printf '%-5s %-4s %-22s %-8s %-20s %-18s\n' 'ID' 'CC' 'Location' 'PORT' 'STATUS' 'IP'
-        echo '────────────────────────────────────────────────────────────────────────────'
-        local idx code name out_port status ip bootstrap reason
-        for idx in "${ORDER[@]}"; do
-            IFS=':' read -r code name out_port <<< "${NODES[$idx]}"
-            [ -f "$BASE_DIR/node_${code}_${out_port}.conf" ] || continue
-            status='UNKNOWN'; ip='-'; bootstrap='-'; reason='-'
-            if state_get "$code" "$out_port"; then status="${STATUS:-UNKNOWN}"; ip="${IP:-${ip}}"; bootstrap="${BOOTSTRAP:-0}%"; reason="${REASON:-}"; fi
-            printf '[%02s] %-4s %-22s %-8s %-20s %-18s\n' "$idx" "$code" "$name" "$out_port" "$status" "$ip"
-        done
-        echo '────────────────────────────────────────────────────────────────────────────'
-        echo "Bootstrap/Reason is stored in node state and refreshed by Auto-Heal."
-        echo 'Press any key to return.'
-        read -t 3 -n 1 -s _key && break || true
+    sync_dynamic_locations
+    draw_header
+    echo -e "${CYAN}» Option 6 - Active Nodes Monitor${NC}"
+    echo -e "${YELLOW}[*] Running a real health probe for every installed node...${NC}"
+    echo -e "${YELLOW}[*] IP = SOCKS public IP; COUNTRY = 2/3 GeoIP agreement; state is saved for Auto-Heal.${NC}\n"
+
+    local idx code name out_port status ip bootstrap reason
+    printf '%-5s %-4s %-22s %-8s %-20s %-18s %-22s\n' 'ID' 'CC' 'Location' 'PORT' 'STATUS' 'IP' 'BOOTSTRAP/REASON'
+    echo '────────────────────────────────────────────────────────────────────────────────────────────────────────────'
+
+    for idx in "${ORDER[@]}"; do
+        IFS=':' read -r code name out_port <<< "${NODES[$idx]}"
+        [ -f "$BASE_DIR/node_${code}_${out_port}.conf" ] || continue
+
+        # Do NOT rotate nodes merely because the screen is opened. This is a
+        # read/probe operation; Auto-Heal remains responsible for repairs.
+        health_check_node "$code" "$name" "$out_port" 1 0 >/dev/null 2>&1 || true
+
+        status='UNKNOWN'; ip='-'; bootstrap='-'; reason='-'
+        if state_get "$code" "$out_port"; then
+            status="${STATUS:-UNKNOWN}"
+            ip="${IP:--}"
+            bootstrap="${BOOTSTRAP:-0}%"
+            reason="${REASON:--}"
+        fi
+        [ -z "$ip" ] && ip='-'
+        [ -z "$reason" ] && reason='-'
+        printf '[%02s] %-4s %-22s %-8s %-20s %-18s %-22s\n' "$idx" "$code" "$name" "$out_port" "$status" "$ip" "$bootstrap/$reason"
     done
+
+    echo '────────────────────────────────────────────────────────────────────────────────────────────────────────────'
+    echo -e "${GREEN}[+] ONLINE${NC}: SOCKS reachable and country verified by GeoIP majority."
+    echo -e "${YELLOW}[!] ONLINE_UNVERIFIED${NC}: SOCKS is working and an IP exists, but GeoIP services did not answer."
+    echo -e "${RED}[!] EXIT_GEOIP_FAIL${NC}: public IP exists but country did not reach the required confidence."
+    echo -e "${RED}[!] DEAD / SOCKS_DEAD${NC}: node process or SOCKS listener is unavailable."
+    echo
+    read -r -p 'Press Enter to return...' < /dev/tty
 }
 
 edit_delete_nodes() {
