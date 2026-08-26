@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Sherlook Automate Engine v6.3.3 (Nexatis API Edition)
-# Stability-focused rebuild with atomic updates, full ISO locations, fast health checks, and continuous auto-heal
+# Sherlook Automate Engine v6.4.0 (Nexatis API Edition)
+# Bugfix release: preserves the existing engine/UI while fixing torrc validation and in-place updates
 
 # ================= COLORS =================
 RED='\033[1;31m'
@@ -22,7 +22,7 @@ RAW_ENGINE_URL="$RAW_BASE/sherlook.sh"
 RAW_INSTALLER_URL="$RAW_BASE/install.sh"
 # Installer resolves this placeholder to the exact commit installed.
 PINNED_COMMIT="__INSTALLER_RESOLVES__"
-SHERLOOK_VERSION="6.3.3"
+SHERLOOK_VERSION="6.4.0"
 LOCATION_CACHE="$DATA_DIR/onionoo_exit_countries.cache"
 LOCATION_CATALOG="$DATA_DIR/location_catalog.tsv"
 LOCATION_CACHE_TTL=21600
@@ -323,7 +323,7 @@ validate_node_ip() {
 }
 
 # Hide exact rejected IPs in the UI/log and show only their /16 range.
-# The full IP is still stored internally in bad_exits.txt for exclusion.
+# The full IP is still stored internally in bad_exits.txt for diagnostics only.
 ip_display_range() {
     local ip="$1"
     if is_valid_ipv4 "$ip"; then
@@ -668,36 +668,43 @@ check_ip_quality() {
 }
 
 send_newnym() {
-    local control_port="$1" pass="$2"
-    (
-        exec 3<>"/dev/tcp/127.0.0.1/${control_port}" 2>/dev/null || exit 1
-        printf 'AUTHENTICATE "%s"\r\nSIGNAL NEWNYM\r\nQUIT\r\n' "$pass" >&3
-        timeout 3 cat <&3 >/dev/null 2>&1
+    # 6.4.0 deliberately keeps the primary torrc minimal. A node may have a
+    # legacy control.env, but NEWNYM is optional; callers must rebuild the
+    # instance when this function returns non-zero.
+    local control_port="${1:-}" pass="${2:-}" response
+    [ -n "$control_port" ] || return 1
+    exec 3<>"/dev/tcp/127.0.0.1/${control_port}" 2>/dev/null || return 1
+    printf 'AUTHENTICATE "%s"\r\n' "$pass" >&3 || { exec 3<&- 3>&-; return 1; }
+    response=$(timeout 3 cat <&3 2>/dev/null | head -n 5 || true)
+    if ! grep -q '^250 OK' <<< "$response"; then
         exec 3<&- 3>&-
-    ) 2>/dev/null || true
+        return 1
+    fi
+    printf 'SIGNAL NEWNYM\r\nQUIT\r\n' >&3 || { exec 3<&- 3>&-; return 1; }
+    response=$(timeout 3 cat <&3 2>/dev/null | head -n 5 || true)
+    exec 3<&- 3>&-
+    grep -q '^250 OK' <<< "$response"
 }
 
 write_node_conf() {
     local conf_file="$1" out_port="$2" control_port="$3" hashed_pass="$4" inst_data_dir="$5" code="$6"
-    local route_code; route_code=$(node_route_code "$code" "$out_port")
-    local bad_file="$inst_data_dir/bad_exits.txt" exclude_line=""
-    if [ -s "$bad_file" ]; then
-        local bad_list; bad_list=$(grep -E '^[0-9]{1,3}(\.[0-9]{1,3}){3}$' "$bad_file" | paste -sd, - 2>/dev/null || true)
-        [ -n "$bad_list" ] && exclude_line="ExcludeExitNodes $bad_list"
-    fi
+    local route_code
+    route_code=$(node_route_code "$code" "$out_port")
+
+    # Keep node startup deliberately close to the original, proven V4.5 torrc.
+    # ControlPort/HashedControlPassword are not required for a basic exit client
+    # and should never be allowed to prevent Tor from booting.
+    # bad_exits.txt is diagnostic history only; its raw IPs are NOT injected into
+    # ExcludeExitNodes because that made older generated torrc files brittle.
     cat > "$conf_file" <<EOF
 SocksPort 127.0.0.1:$out_port
-ControlPort 127.0.0.1:$control_port
-HashedControlPassword $hashed_pass
 DataDirectory $inst_data_dir
-GeoIPExcludeUnknown 1
 ExitNodes {$route_code}
 StrictNodes 1
-$exclude_line
 RunAsDaemon 0
-AvoidDiskWrites 1
 Log notice file $inst_data_dir/notices.log
 EOF
+
     if bridge_available; then
         bridge_validate || return 1
         {
@@ -789,7 +796,7 @@ if [ "${1:-}" = "--auto-heal-daemon" ]; then
 fi
 
 
-# ================= V6.3.3 HEALTH / BRIDGE / PANEL SAFETY =================
+# ================= V6.4.0 HEALTH / BRIDGE / PANEL SAFETY =================
 
 node_dir() { printf '%s\n' "$DATA_DIR/${1}_${2}"; }
 node_index_by_code() {
@@ -1123,8 +1130,8 @@ EOF
     fi
 
     # Primary country gets the full 20-attempt budget. Each fallback route gets
-    # its own independent 5-attempt budget. Fallback IPs are NOT required to
-    # geolocate to the route country; the original node label is preserved.
+    # its own independent 5-attempt budget. A fallback IP must still geolocate
+    # to the actual fallback route; the original display label is preserved.
     local fallback_mode=0
     local fallback_index=0
     local fallback_candidates_arr=()
@@ -1146,7 +1153,7 @@ EOF
         fi
 
         if [ "$fallback_mode" -eq 1 ]; then
-            echo -e "${YELLOW}[!] ${EMOJIS[$code]} $name keeps its original label; fallback route is ${WHITE}$route_code${YELLOW}. IP country is NOT required to match ${route_code}.${NC}"
+            echo -e "${YELLOW}[!] ${EMOJIS[$code]} $name keeps its original label; fallback route is ${WHITE}$route_code${YELLOW}. The public IP must still verify as ${route_code}.${NC}"
             echo -e "${CYAN}[*] Routing ${WHITE}$code - $name ${CYAN}➔ ExitNodes ${MAGENTA}$route_code${CYAN}, Port: ${MAGENTA}$out_port${CYAN}.${NC}"
         else
             echo -e "${CYAN}[*] Routing ${WHITE}$code - $name ${CYAN}➔ ExitNodes ${MAGENTA}$route_code${CYAN}, Port: ${MAGENTA}$out_port${CYAN}.${NC}"
@@ -1175,14 +1182,22 @@ EOF
             if [ -z "$public_ip" ] || ! is_valid_ipv4 "$public_ip"; then
                 echo -e "${CYAN}[*] Waiting for Tor connection (Attempt $total_attempts/$attempt_limit)...${NC}"
             elif [ "$fallback_mode" -eq 1 ]; then
-                # IMPORTANT: fallback routes are intentionally label-independent.
-                # Do not reject a valid public IP because GeoIP says CH/US/etc.
-                echo -e "${CYAN}[*] Fallback route ${MAGENTA}$route_code${CYAN}: accepting public IP ${WHITE}$public_ip${CYAN} without country-match rejection.${NC}"
-                printf '%s\n' "$public_ip" > "$ip_file"
-                echo -e "${GREEN}[+] FALLBACK VERIFIED: $public_ip → label=$code/$name route=$route_code${NC}"
-                echo -e "${GREEN}[+] Online -> ${WHITE}$code - $name ${GREEN}($public_ip)${NC}\n"
-                if panel_conf_safe_load && [ "${PANEL_AUTO_SYNC:-0}" = "1" ]; then panel_sync_single "$(node_index_by_code "$code")" >/dev/null 2>&1 || true; fi
-                return 0
+                echo -e "${CYAN}[*] Verifying fallback IP ${MAGENTA}$public_ip${CYAN} against GeoIP sources for ${WHITE}$route_code${WHITE}...${NC}"
+                local fb_result fb_bad fb_actual fb_reason fb_seen
+                fb_result=$(check_ip_quality "$public_ip" "$route_code")
+                IFS='|' read -r fb_bad fb_actual fb_reason fb_seen <<< "$fb_result"
+                if [ "$fb_bad" = "0" ]; then
+                    printf '%s\n' "$public_ip" > "$ip_file"
+                    echo -e "${GREEN}[+] FALLBACK VERIFIED: $public_ip → label=$code/$name route=$route_code${NC}"
+                    echo -e "${GREEN}[+] GeoIP sources: ${fb_seen}${NC}"
+                    echo -e "${GREEN}[+] Online -> ${WHITE}$code - $name ${GREEN}($public_ip)${NC}\n"
+                    if panel_conf_safe_load && [ "${PANEL_AUTO_SYNC:-0}" = "1" ]; then panel_sync_single "$(node_index_by_code "$code")" >/dev/null 2>&1 || true; fi
+                    return 0
+                fi
+                local fb_display_ip
+                fb_display_ip=$(ip_display_range "$public_ip")
+                echo -e "${RED}[-] Rejected fallback IP range ${fb_display_ip}: ${fb_reason} | detected=${fb_seen:-unknown} | expected=${route_code}${NC}"
+                append_bad_ip "$bad_file" "$public_ip"
             else
                 echo -e "${CYAN}[*] Verifying ${MAGENTA}$public_ip${CYAN} against GeoIP sources for ${WHITE}$route_code${CYAN}...${NC}"
                 local result is_bad actual_cc reason seen_ccs
@@ -1245,15 +1260,22 @@ EOF
 
                 if [ "$newnym_tries" -lt "$MAX_NEWNYM_TRIES" ]; then
                     echo -e "${CYAN}    > Requesting a new circuit (NEWNYM)...${NC}"
-                    send_newnym "$control_port" "$ctrl_pass"
-                    newnym_tries=$((newnym_tries+1))
-                    sleep 6
+                    if send_newnym "$control_port" "$ctrl_pass"; then
+                        newnym_tries=$((newnym_tries+1))
+                        sleep 6
+                    else
+                        echo -e "${YELLOW}    > ControlPort/NEWNYM unavailable; rebuilding this Tor instance instead.${NC}"
+                        stop_tor_node "$code" "$out_port"
+                        sleep 1
+                        run_tor_node "$conf_file" || true
+                        sleep 3
+                        newnym_tries=0
+                    fi
                 else
-                    echo -e "${YELLOW}    > Rebuilding Tor with known-bad IPs excluded...${NC}"
-                    write_node_conf "$conf_file" "$out_port" "$control_port" "$hashed_pass" "$inst_data_dir" "$code"
+                    echo -e "${YELLOW}    > Rebuilding Tor instance after repeated validation failures...${NC}"
                     stop_tor_node "$code" "$out_port"
-                    sleep 2
-                    run_tor_node "$conf_file"
+                    sleep 1
+                    run_tor_node "$conf_file" || true
                     sleep 3
                     newnym_tries=0
                 fi
@@ -1558,26 +1580,86 @@ EOF
 }
 
 update_system() {
-    check_root; draw_header
-    if [ "$PINNED_COMMIT" = "__INSTALLER_RESOLVES__" ] || [ -z "$PINNED_COMMIT" ]; then
-        echo -e "${YELLOW}[!] This runtime is not pinned yet. Re-run install-sherlook to establish a pinned commit.${NC}"; return 1
+    check_root
+    draw_header
+    echo -e "${CYAN}[*] Checking GitHub for the newest Sherlook engine...${NC}"
+
+    local api_url="https://api.github.com/repos/SherlookHolmz/multi/commits/main"
+    local raw_base="https://raw.githubusercontent.com/SherlookHolmz/multi"
+    local commit remote_tmp remote_version local_version backup patched
+
+    remote_tmp=$(mktemp /tmp/sherlook-update.XXXXXX) || return 1
+    patched=$(mktemp /tmp/sherlook-update-patched.XXXXXX) || { rm -f "$remote_tmp"; return 1; }
+    trap 'rm -f "$remote_tmp" "$patched"' RETURN
+
+    commit=$(curl -4 -fsSL --connect-timeout 10 --max-time 30 \
+        -H 'Accept: application/vnd.github+json' \
+        "$api_url" | jq -r '.sha // empty') || commit=""
+
+    if [[ ! "$commit" =~ ^[0-9a-f]{40}$ ]]; then
+        echo -e "${RED}[!] Could not resolve SherlookHolmz/multi@main.${NC}"
+        return 1
     fi
-    echo -e "${CYAN}[*] Repairing Sherlook from pinned commit:${NC} $PINNED_COMMIT"
-    local tmp backup
-    tmp=$(mktemp /tmp/sherlook_pinned.XXXXXX) || return 1
-    if ! curl -4 -fsSL --connect-timeout 10 --max-time 90 -o "$tmp" "https://raw.githubusercontent.com/SherlookHolmz/multi/$PINNED_COMMIT/sherlook.sh"; then
-        rm -f "$tmp"; echo -e "${RED}[!] Pinned source download failed.${NC}"; return 1
+
+    if ! curl -4 -fsSL --connect-timeout 10 --max-time 90 \
+        -o "$remote_tmp" "$raw_base/$commit/sherlook.sh"; then
+        echo -e "${RED}[!] Could not download the remote engine from commit $commit.${NC}"
+        return 1
     fi
-    head -n1 "$tmp" | grep -q '^#!' || { rm -f "$tmp"; echo -e "${RED}[!] Invalid pinned payload.${NC}"; return 1; }
-    bash -n "$tmp" || { rm -f "$tmp"; echo -e "${RED}[!] Pinned source failed syntax validation.${NC}"; return 1; }
-    grep -q 'SHERLOOK_VERSION="6.3.3"' "$tmp" || { rm -f "$tmp"; echo -e "${RED}[!] Pinned source is not the expected 6.3.3 engine.${NC}"; return 1; }
-    backup="$BASE_DIR/sherlook.sh.bak.$(date +%Y%m%d_%H%M%S)"; mkdir -p "$BASE_DIR" /root/.sherlook
+
+    bash -n "$remote_tmp" || {
+        echo -e "${RED}[!] Remote engine failed Bash syntax validation; local installation was not changed.${NC}"
+        return 1
+    }
+
+    remote_version=$(grep -m1 '^SHERLOOK_VERSION=' "$remote_tmp" | sed 's/^SHERLOOK_VERSION="//; s/"$//')
+    local_version="$SHERLOOK_VERSION"
+    if [[ ! "$remote_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+        echo -e "${RED}[!] Remote engine does not contain a valid semantic version.${NC}"
+        return 1
+    fi
+
+    echo -e "${GREEN}[+] Remote version: $remote_version${NC}"
+    echo -e "${GREEN}[+] Remote commit:  $commit${NC}"
+
+    sed "s/^PINNED_COMMIT=\"__INSTALLER_RESOLVES__\"/PINNED_COMMIT=\"$commit\"/" \
+        "$remote_tmp" > "$patched"
+    # Also replace an older embedded pin when updating an already pinned install.
+    sed -i "s/^PINNED_COMMIT=\"[0-9a-f]\{40\}\"/PINNED_COMMIT=\"$commit\"/" "$patched"
+    bash -n "$patched" || {
+        echo -e "${RED}[!] Patched remote engine failed syntax validation.${NC}"
+        return 1
+    }
+
+    backup="$BASE_DIR/sherlook.sh.bak.$(date +%Y%m%d_%H%M%S)"
+    mkdir -p "$BASE_DIR" /root/.sherlook
     [ -f "$INSTALL_PATH" ] && cp -a "$INSTALL_PATH" "$backup"
-    install -m 755 "$tmp" "$INSTALL_PATH.new" && mv -f "$INSTALL_PATH.new" "$INSTALL_PATH"
-    install -m 755 "$tmp" /root/.sherlook/sherlook.sh
-    rm -f "$tmp"
-    echo -e "${GREEN}[+] Pinned repair completed atomically. Backup: $backup${NC}"
-    systemctl restart sherlook-heal.service 2>/dev/null || true
+
+    # Preserve all node data/configuration. Only the engine binary/script is replaced.
+    systemctl stop sherlook-heal.service 2>/dev/null || true
+    install -m 755 "$patched" "$INSTALL_PATH.new"
+    mv -f "$INSTALL_PATH.new" "$INSTALL_PATH"
+    install -m 755 "$patched" /root/.sherlook/sherlook.sh
+
+    if [ -f /etc/systemd/system/sherlook-heal.service ]; then
+        sed -i "s#^ExecStart=.*#ExecStart=$INSTALL_PATH --auto-heal-daemon#" \
+            /etc/systemd/system/sherlook-heal.service
+    fi
+    systemctl daemon-reload
+    systemctl enable --now sherlook-heal.service 2>/dev/null || true
+
+    local installed_version
+    installed_version=$($INSTALL_PATH --version 2>/dev/null || true)
+    if [ "$installed_version" != "$remote_version" ]; then
+        echo -e "${RED}[!] Post-update version check failed: got '$installed_version', expected '$remote_version'.${NC}"
+        return 1
+    fi
+
+    echo -e "${GREEN}[+] Sherlook updated in-place: v${local_version} -> v${remote_version}${NC}"
+    echo -e "${GREEN}[+] Existing node data/configuration was preserved.${NC}"
+    echo -e "${GREEN}[+] Backup: ${backup}${NC}"
+    echo -e "${GREEN}[+] Pinned to commit: ${commit}${NC}"
+    sleep 2
     exec "$INSTALL_PATH"
 }
 
