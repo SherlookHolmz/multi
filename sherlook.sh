@@ -397,23 +397,38 @@ stop_tor_node() {
 }
 
 run_tor_node() {
-    local conf="$1" data_dir log_file code port
+    local conf="$1" data_dir log_file code port verify_log launch_pid
     data_dir=$(awk '$1=="DataDirectory"{print $2; exit}' "$conf" 2>/dev/null || true)
-    [ -n "$data_dir" ] || data_dir="/var/lib/tor/sherlook_nodes/unknown"
+    [ -n "$data_dir" ] || { echo -e "${RED}[!] DataDirectory missing in $conf.${NC}"; return 1; }
     mkdir -p "$data_dir"
     log_file="$data_dir/notices.log"
-    touch "$log_file" 2>/dev/null || true
+    verify_log="$data_dir/verify.log"
+    touch "$log_file" "$verify_log" 2>/dev/null || true
+
     if id debian-tor >/dev/null 2>&1; then
-        chown debian-tor:debian-tor "$log_file" "$data_dir" 2>/dev/null || true
+        chown -R debian-tor:debian-tor "$data_dir" 2>/dev/null || true
     fi
 
-    if ! tor -f "$conf" --verify-config >/dev/null 2>"$log_file"; then
-        echo -e "${RED}[!] Tor config verification failed: $conf${NC}"
-        tail -n 20 "$log_file" 2>/dev/null || true
-        return 1
+    # Verify using the SAME account that will execute Tor. This catches
+    # permissions/DataDirectory problems instead of reporting a misleading
+    # generic config failure from a root-only validation.
+    : > "$verify_log"
+    if id debian-tor >/dev/null 2>&1 && command -v runuser >/dev/null 2>&1; then
+        if ! runuser -u debian-tor -- tor -f "$conf" --verify-config >"$verify_log" 2>&1; then
+            echo -e "${RED}[!] Tor config verification failed: $conf${NC}"
+            echo -e "${YELLOW}[!] Exact verification error:${NC}"
+            tail -n 60 "$verify_log" 2>/dev/null || true
+            return 1
+        fi
+    else
+        if ! tor -f "$conf" --verify-config >"$verify_log" 2>&1; then
+            echo -e "${RED}[!] Tor config verification failed: $conf${NC}"
+            tail -n 60 "$verify_log" 2>/dev/null || true
+            return 1
+        fi
     fi
 
-    local launch_pid
+    : > "$log_file"
     if id debian-tor >/dev/null 2>&1 && command -v runuser >/dev/null 2>&1; then
         runuser -u debian-tor -- tor -f "$conf" >>"$log_file" 2>&1 &
         launch_pid=$!
@@ -432,10 +447,23 @@ run_tor_node() {
         chmod 600 "$(node_pid_file "$code" "$port")"
     fi
 
-    sleep 1
-    if ! kill -0 "$launch_pid" 2>/dev/null; then
-        echo -e "${RED}[!] Tor exited immediately for $conf.${NC}"
-        tail -n 40 "$log_file" 2>/dev/null || true
+    # Do not claim success just because the launcher process exists.
+    # Wait briefly for the SOCKS listener; early Tor errors are preserved in log.
+    local ready=0
+    for _ in 1 2 3 4 5 6 7 8 9 10; do
+        if ! kill -0 "$launch_pid" 2>/dev/null; then break; fi
+        if (exec 3<>"/dev/tcp/127.0.0.1/$port") 2>/dev/null; then
+            exec 3<&- 3>&-
+            ready=1
+            break
+        fi
+        sleep 1
+    done
+
+    if [ "$ready" -ne 1 ]; then
+        echo -e "${RED}[!] Tor started but SOCKS $port did not become ready.${NC}"
+        tail -n 80 "$log_file" 2>/dev/null || true
+        stop_tor_node "$code" "$port"
         return 1
     fi
     return 0
@@ -687,22 +715,20 @@ send_newnym() {
 }
 
 write_node_conf() {
-    local conf_file="$1" out_port="$2" control_port="$3" hashed_pass="$4" inst_data_dir="$5" code="$6"
+    local conf_file="$1" out_port="$2" _control_port="$3" _hashed_pass="$4" inst_data_dir="$5" code="$6"
     local route_code
     route_code=$(node_route_code "$code" "$out_port")
 
-    # Keep node startup deliberately close to the original, proven V4.5 torrc.
-    # ControlPort/HashedControlPassword are not required for a basic exit client
-    # and should never be allowed to prevent Tor from booting.
-    # bad_exits.txt is diagnostic history only; its raw IPs are NOT injected into
-    # ExcludeExitNodes because that made older generated torrc files brittle.
+    # Proven minimal client torrc. Do not put dynamic IP exclusions,
+    # ControlPort authentication, or diagnostic logging directives here.
+    # Tor receives stdout/stderr through run_tor_node(), so a broken torrc
+    # can never be hidden behind /dev/null.
     cat > "$conf_file" <<EOF
 SocksPort 127.0.0.1:$out_port
 DataDirectory $inst_data_dir
 ExitNodes {$route_code}
 StrictNodes 1
 RunAsDaemon 0
-Log notice file $inst_data_dir/notices.log
 EOF
 
     if bridge_available; then
@@ -713,6 +739,7 @@ EOF
             cat "$BRIDGE_FILE"
         } >> "$conf_file"
     fi
+    chown root:debian-tor "$conf_file" 2>/dev/null || true
     chmod 640 "$conf_file"
 }
 
@@ -1073,7 +1100,7 @@ draw_header() {
     echo -e "${MAGENTA} ║${CYAN}   ╚════██║██╔══██║██╔══╝  ██╔══██╗██║     ██║   ██║██║   ██║██╔═██╗ ${MAGENTA} ║${NC}"
     echo -e "${MAGENTA} ║${CYAN}   ███████║██║  ██║███████╗██║  ██║███████╗╚██████╔╝╚██████╔╝██║  ██╗${MAGENTA} ║${NC}"
     echo -e "${MAGENTA} ║${CYAN}   ╚══════╝╚═╝  ╚═╝╚══════╝╚═╝  ╚═╝╚══════╝ ╚═════╝  ╚═════╝ ╚═╝  ╚═╝${MAGENTA} ║${NC}"
-    echo -e "${MAGENTA} ║${YELLOW}          A U T O M A T E   E N G I N E   V 6 . 3 . 3                   ${MAGENTA}║${NC}"
+    echo -e "${MAGENTA} ║${YELLOW}          A U T O M A T E   E N G I N E   V 6 . 4 . 0                   ${MAGENTA}║${NC}"
     echo -e "${MAGENTA} ╚════════════════════════════════════════════════════════╝${NC}"
     echo ""
 }
@@ -1616,6 +1643,11 @@ update_system() {
     local_version="$SHERLOOK_VERSION"
     if [[ ! "$remote_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
         echo -e "${RED}[!] Remote engine does not contain a valid semantic version.${NC}"
+        return 1
+    fi
+
+    if [ "$(printf '%s\n' "$remote_version" "$local_version" | sort -V | head -n1)" != "$local_version" ]; then
+        echo -e "${YELLOW}[!] Remote engine $remote_version is older than the installed engine $local_version; refusing downgrade.${NC}"
         return 1
     fi
 
