@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Sherlook Automate Engine v6.1 (Nexatis API Edition)
+# Sherlook Automate Engine v6.3.3 (Nexatis API Edition)
 # Stability-focused rebuild with atomic updates, full ISO locations, fast health checks, and continuous auto-heal
 
 # ================= COLORS =================
@@ -22,7 +22,7 @@ RAW_ENGINE_URL="$RAW_BASE/sherlook.sh"
 RAW_INSTALLER_URL="$RAW_BASE/install.sh"
 # Installer resolves this placeholder to the exact commit installed.
 PINNED_COMMIT="__INSTALLER_RESOLVES__"
-SHERLOOK_VERSION="6.3.2"
+SHERLOOK_VERSION="6.3.3"
 LOCATION_CACHE="$DATA_DIR/onionoo_exit_countries.cache"
 LOCATION_CATALOG="$DATA_DIR/location_catalog.tsv"
 LOCATION_CACHE_TTL=21600
@@ -372,20 +372,88 @@ command_or_empty() {
     command -v "$1" 2>/dev/null || true
 }
 
-run_tor_node() {
-    local conf="$1"
-    if id debian-tor >/dev/null 2>&1 && command -v runuser >/dev/null 2>&1; then
-        runuser -u debian-tor -- tor -f "$conf" >/dev/null 2>&1 &
-    elif id debian-tor >/dev/null 2>&1 && command -v sudo >/dev/null 2>&1; then
-        sudo -u debian-tor tor -f "$conf" >/dev/null 2>&1 &
-    else
-        tor -f "$conf" >/dev/null 2>&1 &
+node_pid_file() {
+    local code="$1" port="$2"
+    printf '%s/tor.pid\n' "$DATA_DIR/${code}_${port}"
+}
+
+stop_tor_node() {
+    local code="$1" port="$2" pid_file pid
+    pid_file=$(node_pid_file "$code" "$port")
+    if [ -r "$pid_file" ]; then
+        pid=$(tr -dc '0-9' < "$pid_file" 2>/dev/null || true)
+        if [[ "$pid" =~ ^[0-9]+$ ]] && kill -0 "$pid" 2>/dev/null; then
+            kill "$pid" 2>/dev/null || true
+            for _ in 1 2 3 4 5; do
+                kill -0 "$pid" 2>/dev/null || break
+                sleep 1
+            done
+            kill -9 "$pid" 2>/dev/null || true
+        fi
     fi
+    rm -f "$pid_file"
+    # Compatibility cleanup for instances launched by older Sherlook builds.
+    pkill -f "node_${code}_${port}\.conf" 2>/dev/null || true
+}
+
+run_tor_node() {
+    local conf="$1" data_dir log_file code port
+    data_dir=$(awk '$1=="DataDirectory"{print $2; exit}' "$conf" 2>/dev/null || true)
+    [ -n "$data_dir" ] || data_dir="/var/lib/tor/sherlook_nodes/unknown"
+    mkdir -p "$data_dir"
+    log_file="$data_dir/notices.log"
+    touch "$log_file" 2>/dev/null || true
+    if id debian-tor >/dev/null 2>&1; then
+        chown debian-tor:debian-tor "$log_file" "$data_dir" 2>/dev/null || true
+    fi
+
+    if ! tor -f "$conf" --verify-config >/dev/null 2>"$log_file"; then
+        echo -e "${RED}[!] Tor config verification failed: $conf${NC}"
+        tail -n 20 "$log_file" 2>/dev/null || true
+        return 1
+    fi
+
+    local launch_pid
+    if id debian-tor >/dev/null 2>&1 && command -v runuser >/dev/null 2>&1; then
+        runuser -u debian-tor -- tor -f "$conf" >>"$log_file" 2>&1 &
+        launch_pid=$!
+    elif id debian-tor >/dev/null 2>&1 && command -v sudo >/dev/null 2>&1; then
+        sudo -u debian-tor tor -f "$conf" >>"$log_file" 2>&1 &
+        launch_pid=$!
+    else
+        tor -f "$conf" >>"$log_file" 2>&1 &
+        launch_pid=$!
+    fi
+
+    code=$(basename "$conf" | sed -n 's/^node_\([^_]*\)_.*$/\1/p')
+    port=$(basename "$conf" | sed -n 's/^node_[^_]*_\([0-9]*\)\.conf$/\1/p')
+    if [[ "$code" =~ ^[A-Z0-9]+$ && "$port" =~ ^[0-9]+$ ]]; then
+        printf '%s\n' "$launch_pid" > "$(node_pid_file "$code" "$port")"
+        chmod 600 "$(node_pid_file "$code" "$port")"
+    fi
+
+    sleep 1
+    if ! kill -0 "$launch_pid" 2>/dev/null; then
+        echo -e "${RED}[!] Tor exited immediately for $conf.${NC}"
+        tail -n 40 "$log_file" 2>/dev/null || true
+        return 1
+    fi
+    return 0
 }
 
 node_process_running() {
-    local code="$1" port="$2"
-    pgrep -f "node_${code}_${port}\.conf" >/dev/null 2>&1
+    local code="$1" port="$2" pid_file pid args
+    pid_file=$(node_pid_file "$code" "$port")
+    if [ -r "$pid_file" ]; then
+        pid=$(tr -dc '0-9' < "$pid_file" 2>/dev/null || true)
+        if [[ "$pid" =~ ^[0-9]+$ ]] && kill -0 "$pid" 2>/dev/null; then
+            args=$(ps -p "$pid" -o args= 2>/dev/null || true)
+            if [[ "$args" == *"node_${code}_${port}.conf"* || "$args" == *"tor -f $BASE_DIR/node_${code}_${port}.conf"* ]]; then
+                return 0
+            fi
+        fi
+    fi
+    return 1
 }
 
 append_bad_ip() {
@@ -497,7 +565,7 @@ cleanup_failed_node() {
     local conf_file="$BASE_DIR/node_${code}_${out_port}.conf"
     local inst_data_dir="$DATA_DIR/${code}_${out_port}"
 
-    pkill -f "node_${code}_${out_port}.conf" 2>/dev/null || true
+    stop_tor_node "$code" "$out_port"
     sleep 1
     rm -f "$conf_file"
     rm -rf "$inst_data_dir"
@@ -537,29 +605,58 @@ check_ip_quality() {
     api2=$(cat "$tmpdir/b" 2>/dev/null || true)
     api3=$(cat "$tmpdir/c" 2>/dev/null || true)
 
-    cc1=$(echo "$api1" | jq -r '.location.country_code // .country_code // empty' 2>/dev/null | tr '[:lower:]' '[:upper:]')
-    cc2=$(echo "$api2" | jq -r '.country_code // .countryCode // empty' 2>/dev/null | tr '[:lower:]' '[:upper:]')
-    cc3=$(echo "$api3" | jq -r '.country_code // empty' 2>/dev/null | tr '[:lower:]' '[:upper:]')
+    cc1=$(printf '%s' "$api1" | jq -r '.location.country_code // .country_code // empty' 2>/dev/null | tr '[:lower:]' '[:upper:]')
+    cc2=$(printf '%s' "$api2" | jq -r '.country_code // .countryCode // empty' 2>/dev/null | tr '[:lower:]' '[:upper:]')
+    cc3=$(printf '%s' "$api3" | jq -r '.country_code // empty' 2>/dev/null | tr '[:lower:]' '[:upper:]')
 
-    local verified=0 mismatch=0 high_risk=0
+    local total=0 expected_hits=0 other_hits=0 high_risk=0 cc
     for cc in "$cc1" "$cc2" "$cc3"; do
-        if [ -n "$cc" ]; then
-            verified=1
-            [ "$cc" != "$expected_cc" ] && mismatch=1
+        [ -n "$cc" ] || continue
+        total=$((total+1))
+        if [ "$cc" = "$expected_cc" ]; then
+            expected_hits=$((expected_hits+1))
+        else
+            other_hits=$((other_hits+1))
         fi
     done
-    if echo "$api1" | grep -iq '"abuser_score".*"High"'; then high_risk=1; fi
+
+    local risk_level=""
+    risk_level=$(jq -r '.abuser_score // .abuse_score // empty' "$tmpdir/a" 2>/dev/null || true)
+    if [[ "$risk_level" =~ (High|VERY_HIGH|Very.High) ]]; then high_risk=1; fi
 
     local bad=0 reason=""
-    if [ "$verified" -eq 0 ]; then bad=0; reason="GEOIP_UNAVAILABLE_TRUSTING_TOR"
-    elif [ "$mismatch" -eq 1 ]; then bad=1; reason="COUNTRY_MISMATCH"
-    elif [ "$high_risk" -eq 1 ]; then bad=1; reason="HIGH_RISK"
-    else reason="VERIFIED"; fi
+    if [ "$total" -eq 0 ]; then
+        bad=0
+        reason="GEOIP_UNAVAILABLE"
+    elif [ "$expected_hits" -ge 2 ]; then
+        bad=0
+        reason="VERIFIED_${expected_hits}OF3"
+    elif [ "$other_hits" -ge 2 ]; then
+        bad=1
+        reason="COUNTRY_MISMATCH"
+    elif [ "$total" -eq 1 ] && [ "$expected_hits" -eq 1 ]; then
+        bad=0
+        reason="GEOIP_SINGLE_SOURCE"
+    else
+        bad=1
+        reason="GEOIP_CONFLICT"
+    fi
+
+    if [ "$high_risk" -eq 1 ]; then
+        bad=1
+        reason="HIGH_RISK"
+    fi
 
     local actual_cc=""
-    if [ -n "$cc1" ]; then actual_cc="$cc1"
-    elif [ -n "$cc2" ]; then actual_cc="$cc2"
-    elif [ -n "$cc3" ]; then actual_cc="$cc3"; fi
+    if [ "$expected_hits" -ge 2 ]; then
+        actual_cc="$expected_cc"
+    elif [ -n "$cc1" ]; then
+        actual_cc="$cc1"
+    elif [ -n "$cc2" ]; then
+        actual_cc="$cc2"
+    elif [ -n "$cc3" ]; then
+        actual_cc="$cc3"
+    fi
 
     local seen=""
     for cc in "$cc1" "$cc2" "$cc3"; do
@@ -597,9 +694,9 @@ GeoIPExcludeUnknown 1
 ExitNodes {$route_code}
 StrictNodes 1
 $exclude_line
-RunAsDaemon 1
+RunAsDaemon 0
 AvoidDiskWrites 1
-Log err file $inst_data_dir/notices.log
+Log notice file $inst_data_dir/notices.log
 EOF
     if bridge_available; then
         bridge_validate || return 1
@@ -692,7 +789,7 @@ if [ "${1:-}" = "--auto-heal-daemon" ]; then
 fi
 
 
-# ================= V6.3.2 HEALTH / BRIDGE / PANEL SAFETY =================
+# ================= V6.3.3 HEALTH / BRIDGE / PANEL SAFETY =================
 
 node_dir() { printf '%s\n' "$DATA_DIR/${1}_${2}"; }
 node_index_by_code() {
@@ -969,7 +1066,7 @@ draw_header() {
     echo -e "${MAGENTA} ║${CYAN}   ╚════██║██╔══██║██╔══╝  ██╔══██╗██║     ██║   ██║██║   ██║██╔═██╗ ${MAGENTA} ║${NC}"
     echo -e "${MAGENTA} ║${CYAN}   ███████║██║  ██║███████╗██║  ██║███████╗╚██████╔╝╚██████╔╝██║  ██╗${MAGENTA} ║${NC}"
     echo -e "${MAGENTA} ║${CYAN}   ╚══════╝╚═╝  ╚═╝╚══════╝╚═╝  ╚═╝╚══════╝ ╚═════╝  ╚═════╝ ╚═╝  ╚═╝${MAGENTA} ║${NC}"
-    echo -e "${MAGENTA} ║${YELLOW}          A U T O M A T E   E N G I N E   V 6 . 3 . 2                   ${MAGENTA}║${NC}"
+    echo -e "${MAGENTA} ║${YELLOW}          A U T O M A T E   E N G I N E   V 6 . 3 . 3                   ${MAGENTA}║${NC}"
     echo -e "${MAGENTA} ╚════════════════════════════════════════════════════════╝${NC}"
     echo ""
 }
@@ -1044,7 +1141,7 @@ EOF
         chown debian-tor:debian-tor "$conf_file" 2>/dev/null || true
 
         if pgrep -f "node_${code}_${out_port}" > /dev/null; then
-            pkill -f "node_${code}_${out_port}\.conf" 2>/dev/null || true
+            stop_tor_node "$code" "$out_port"
             sleep 2
         fi
 
@@ -1055,16 +1152,23 @@ EOF
             echo -e "${CYAN}[*] Routing ${WHITE}$code - $name ${CYAN}➔ ExitNodes ${MAGENTA}$route_code${CYAN}, Port: ${MAGENTA}$out_port${CYAN}.${NC}"
         fi
 
-        run_tor_node "$conf_file"
-        echo -e "${CYAN}[*] Tor started. Validation begins at Attempt 1/${attempt_limit}.${NC}"
+        local tor_start_failed=0
+        if ! run_tor_node "$conf_file"; then
+            echo -e "${RED}[-] Tor could not start for route ${route_code}. See ${inst_data_dir}/notices.log${NC}"
+            stop_tor_node "$code" "$out_port"
+            tor_start_failed=1
+        else
+            echo -e "${CYAN}[*] Tor started. Validation begins at Attempt 1/${attempt_limit}.${NC}"
+        fi
 
         local total_attempts=0
         local newnym_tries=0
         local last_ip=""
         local country_failures=0
 
-        while [ "$total_attempts" -lt "$attempt_limit" ]; do
-            total_attempts=$((total_attempts+1))
+        if [ "$tor_start_failed" -eq 0 ]; then
+            while [ "$total_attempts" -lt "$attempt_limit" ]; do
+                total_attempts=$((total_attempts+1))
             local public_ip
             public_ip=$(curl -4 -sS --socks5-hostname 127.0.0.1:"$out_port" https://api.ipify.org --connect-timeout 5 --max-time 12 2>/dev/null | tr -d '\0\r\n' || true)
 
@@ -1119,7 +1223,7 @@ EOF
                                 # Stop the current primary-country Tor process before
                                 # selecting the first fallback route. No more IP checks
                                 # are performed for the primary route in this cycle.
-                                pkill -f "node_${code}_${out_port}\.conf" 2>/dev/null || true
+                                stop_tor_node "$code" "$out_port"
                                 sleep 1
                                 break
                                 ;;
@@ -1147,14 +1251,15 @@ EOF
                 else
                     echo -e "${YELLOW}    > Rebuilding Tor with known-bad IPs excluded...${NC}"
                     write_node_conf "$conf_file" "$out_port" "$control_port" "$hashed_pass" "$inst_data_dir" "$code"
-                    pkill -f "node_${code}_${out_port}\.conf" 2>/dev/null || true
+                    stop_tor_node "$code" "$out_port"
                     sleep 2
                     run_tor_node "$conf_file"
                     sleep 3
                     newnym_tries=0
                 fi
             fi
-        done
+            done
+        fi
 
         # If the 5-wrong-IP action already switched to fallback, do NOT ask the
         # old 20-attempt question again. Go directly to the fallback selector.
@@ -1251,7 +1356,10 @@ rotate_one_node_core() {
         [ "$silent" = "1" ] || echo -e "${YELLOW}    > Tor process for $code is not running — starting it now...${NC}"
         rm -f "$ip_file"
         write_node_conf "$conf_file" "$out_port" "$CTRL_PORT" "$HASHED_PASS" "$inst_data_dir" "$code"
-        run_tor_node "$conf_file"
+        if ! run_tor_node "$conf_file"; then
+            [ "$silent" = "1" ] || echo -e "${RED}    > Tor failed to start; see $inst_data_dir/notices.log${NC}"
+            return 1
+        fi
         sleep 5
     fi
 
@@ -1307,7 +1415,7 @@ rotate_one_node_core() {
             [ "$silent" = "1" ] || echo -e "${YELLOW}    > ${code}: rebuilding Tor after $attempt failed validation attempts...${NC}"
             if is_valid_ipv4 "$new_ip"; then append_bad_ip "$bad_file" "$new_ip"; fi
             write_node_conf "$conf_file" "$out_port" "$CTRL_PORT" "$HASHED_PASS" "$inst_data_dir" "$code"
-            pkill -f "node_${code}_${out_port}\.conf" 2>/dev/null || true
+            stop_tor_node "$code" "$out_port"
             sleep 1
             run_tor_node "$conf_file"
             sleep 2
@@ -1462,7 +1570,7 @@ update_system() {
     fi
     head -n1 "$tmp" | grep -q '^#!' || { rm -f "$tmp"; echo -e "${RED}[!] Invalid pinned payload.${NC}"; return 1; }
     bash -n "$tmp" || { rm -f "$tmp"; echo -e "${RED}[!] Pinned source failed syntax validation.${NC}"; return 1; }
-    grep -q 'SHERLOOK_VERSION="6.3.2"' "$tmp" || { rm -f "$tmp"; echo -e "${RED}[!] Pinned source is not the expected 6.3.2 engine.${NC}"; return 1; }
+    grep -q 'SHERLOOK_VERSION="6.3.3"' "$tmp" || { rm -f "$tmp"; echo -e "${RED}[!] Pinned source is not the expected 6.3.3 engine.${NC}"; return 1; }
     backup="$BASE_DIR/sherlook.sh.bak.$(date +%Y%m%d_%H%M%S)"; mkdir -p "$BASE_DIR" /root/.sherlook
     [ -f "$INSTALL_PATH" ] && cp -a "$INSTALL_PATH" "$backup"
     install -m 755 "$tmp" "$INSTALL_PATH.new" && mv -f "$INSTALL_PATH.new" "$INSTALL_PATH"
