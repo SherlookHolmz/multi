@@ -20,15 +20,25 @@ INSTALL_PATH="/usr/local/bin/sherlook"
 RAW_BASE="https://raw.githubusercontent.com/SherlookHolmz/multi/main"
 RAW_ENGINE_URL="$RAW_BASE/sherlook.sh"
 RAW_INSTALLER_URL="$RAW_BASE/install.sh"
-SHERLOOK_VERSION="6.2.3"
+# Installer resolves this placeholder to the exact commit installed.
+PINNED_COMMIT="__INSTALLER_RESOLVES__"
+SHERLOOK_VERSION="6.3.2"
 LOCATION_CACHE="$DATA_DIR/onionoo_exit_countries.cache"
 LOCATION_CATALOG="$DATA_DIR/location_catalog.tsv"
 LOCATION_CACHE_TTL=21600
 AUTO_HEAL_INTERVAL=5
 AUTO_HEAL_PARALLEL=16
+EFFECTIVE_PARALLEL=16
+BRIDGE_MODE=0
+BRIDGE_PARALLEL=2
+BRIDGE_FILE="$BASE_DIR/bridges.conf"
 NODE_ROTATE_RETRIES=20
-HEALTH_CONNECT_TIMEOUT=2
-HEALTH_MAX_TIME=5
+HEALTH_CONNECT_TIMEOUT=5
+HEALTH_MAX_TIME=15
+HEALTH_STALE_AFTER=90
+QUARANTINE_BASE=300
+QUARANTINE_MAX=3600
+
 
 # Panel Config Cache
 PANEL_CONF="$BASE_DIR/nexatis_panel.conf"
@@ -571,21 +581,14 @@ send_newnym() {
 }
 
 write_node_conf() {
-    local conf_file="$1" out_port="$2" control_port="$3" hashed_pass="$4"
-    local inst_data_dir="$5" code="$6"
-    local route_code="$(node_route_code "$code" "$out_port")"
-    local bad_file="$inst_data_dir/bad_exits.txt"
-    local exclude_line=""
-
+    local conf_file="$1" out_port="$2" control_port="$3" hashed_pass="$4" inst_data_dir="$5" code="$6"
+    local route_code; route_code=$(node_route_code "$code" "$out_port")
+    local bad_file="$inst_data_dir/bad_exits.txt" exclude_line=""
     if [ -s "$bad_file" ]; then
-        local bad_list
-        bad_list=$(grep -E '^[0-9]{1,3}(\.[0-9]{1,3}){3}(/([0-9]|[12][0-9]|3[0-2]))?$' "$bad_file" | paste -sd, - 2>/dev/null || true)
-        if [ -n "$bad_list" ]; then
-            exclude_line="ExcludeExitNodes $bad_list"
-        fi
+        local bad_list; bad_list=$(grep -E '^[0-9]{1,3}(\.[0-9]{1,3}){3}$' "$bad_file" | paste -sd, - 2>/dev/null || true)
+        [ -n "$bad_list" ] && exclude_line="ExcludeExitNodes $bad_list"
     fi
-
-    cat <<EOF > "$conf_file"
+    cat > "$conf_file" <<EOF
 SocksPort 127.0.0.1:$out_port
 ControlPort 127.0.0.1:$control_port
 HashedControlPassword $hashed_pass
@@ -598,80 +601,68 @@ RunAsDaemon 1
 AvoidDiskWrites 1
 Log err file $inst_data_dir/notices.log
 EOF
+    if bridge_available; then
+        bridge_validate || return 1
+        {
+            echo 'UseBridges 1'
+            echo 'ClientTransportPlugin obfs4 exec /usr/bin/obfs4proxy'
+            cat "$BRIDGE_FILE"
+        } >> "$conf_file"
+    fi
+    chmod 640 "$conf_file"
 }
 
 health_check_node() {
     local code="$1" name="$2" out_port="$3" silent="${4:-1}"
-    local conf_file="$BASE_DIR/node_${code}_${out_port}.conf"
-    local inst_data_dir="$DATA_DIR/${code}_${out_port}"
-    local ip_file="$inst_data_dir/last_ip.txt"
+    local conf_file="$BASE_DIR/node_${code}_${out_port}.conf" inst_data_dir="$DATA_DIR/${code}_${out_port}" ip_file="$DATA_DIR/${code}_${out_port}/last_ip.txt"
     [ -f "$conf_file" ] || return 0
-
-    if ! acquire_node_lock "$code" "$out_port"; then
-        return 3
-    fi
-
-    local current_ip="" old_ip="" result bad actual reason seen
-    [ -s "$ip_file" ] && old_ip=$(head -n1 "$ip_file" | tr -d '\r\n')
-
+    if node_quarantine_active "$code" "$out_port"; then return 4; fi
+    local bootstrap_raw bootstrap_pct bootstrap_tag current_ip reason expected_route result bad actual seen
+    bootstrap_raw=$(bootstrap_status "$code" "$out_port" "$inst_data_dir"); bootstrap_pct=${bootstrap_raw%%|*}; bootstrap_tag=${bootstrap_raw#*|}
     if ! node_process_running "$code" "$out_port"; then
-        [ "$silent" = "1" ] || echo -e "${YELLOW}[!] $code process is down; rotating immediately.${NC}"
-        release_node_lock
-        rotate_one_node "$code" "$name" "$out_port" "$silent"
-        return $?
+        state_set "$code" "$out_port" DEAD "" "$bootstrap_pct" "PROCESS_DOWN"
+        rotate_one_node "$code" "$name" "$out_port" "$silent"; local rc=$?
+        (( rc == 0 )) && quarantine_clear "$code" "$out_port" || quarantine_record_failure "$code" "$out_port" "PROCESS_DOWN"
+        return $rc
     fi
-
     current_ip=$(get_node_ip "$out_port")
     if ! is_valid_ipv4 "$current_ip"; then
-        sleep 1
-        current_ip=$(get_node_ip "$out_port")
+        state_set "$code" "$out_port" "SOCKS_DEAD" "" "$bootstrap_pct" "SOCKS_UNREACHABLE"
+        rotate_one_node "$code" "$name" "$out_port" "$silent"; local rc=$?
+        (( rc == 0 )) && quarantine_clear "$code" "$out_port" || quarantine_record_failure "$code" "$out_port" "SOCKS_UNREACHABLE"
+        return $rc
     fi
-
-    if ! is_valid_ipv4 "$current_ip"; then
-        [ "$silent" = "1" ] || echo -e "${RED}[!] $code returned no valid public IP; rotating now.${NC}"
-        release_node_lock
-        rotate_one_node "$code" "$name" "$out_port" "$silent"
-        return $?
+    expected_route=$(node_route_code "$code" "$out_port")
+    result=$(check_ip_quality "$current_ip" "$expected_route"); IFS='|' read -r bad actual reason seen <<< "$result"
+    if [ "$bad" != "0" ]; then
+        state_set "$code" "$out_port" "EXIT_GEOIP_FAIL" "$current_ip" "$bootstrap_pct" "$reason"
+        rotate_one_node "$code" "$name" "$out_port" "$silent"; local rc=$?
+        (( rc == 0 )) && quarantine_clear "$code" "$out_port" || quarantine_record_failure "$code" "$out_port" "$reason"
+        return $rc
     fi
-
-    if [ "$current_ip" != "$old_ip" ] || ! is_valid_ipv4 "$old_ip"; then
-        local expected_route="$(node_route_code "$code" "$out_port")"
-        result=$(check_ip_quality "$current_ip" "$expected_route")
-        IFS='|' read -r bad actual reason seen <<< "$result"
-        if [ "$bad" = "0" ]; then
-            printf '%s\n' "$current_ip" > "$ip_file"
-            release_node_lock
-            return 0
-        fi
-        append_bad_ip "$inst_data_dir/bad_exits.txt" "$current_ip"
-        [ "$silent" = "1" ] || echo -e "${RED}[!] $code rejected IP $current_ip ($reason); rotating now.${NC}"
-        release_node_lock
-        rotate_one_node "$code" "$name" "$out_port" "$silent"
-        return $?
+    printf '%s\n' "$current_ip" > "$ip_file"
+    quarantine_clear "$code" "$out_port"
+    if (( bootstrap_pct < 100 )); then
+        state_set "$code" "$out_port" "BOOTSTRAP(${bootstrap_pct}%)" "$current_ip" "$bootstrap_pct" "$bootstrap_tag"
+    else
+        state_set "$code" "$out_port" ONLINE "$current_ip" "$bootstrap_pct" "VERIFIED:${seen}"
     fi
-
-    release_node_lock
     return 0
 }
 
 background_auto_heal() {
     check_root
     sync_dynamic_locations
-    local idx details code name out_port
+    compute_effective_parallel
+    if bridge_available; then bridge_validate || return 1; fi
+    local idx details code name out_port running=0
     local -a pids=()
-    local running=0
-
     for idx in "${ORDER[@]}"; do
-        details="${NODES[$idx]}"
-        IFS=':' read -r code name out_port <<< "$details"
+        details="${NODES[$idx]}"; IFS=':' read -r code name out_port <<< "$details"
         [ -f "$BASE_DIR/node_${code}_${out_port}.conf" ] || continue
-        health_check_node "$code" "$name" "$out_port" 1 &
-        pids+=("$!")
-        running=$((running+1))
-        if (( running >= AUTO_HEAL_PARALLEL )); then
-            wait "${pids[0]}" 2>/dev/null || true
-            pids=("${pids[@]:1}")
-            running=$((running-1))
+        health_check_node "$code" "$name" "$out_port" 1 & pids+=("$!"); running=$((running+1))
+        if (( running >= EFFECTIVE_PARALLEL )); then
+            wait "${pids[0]}" 2>/dev/null || true; pids=("${pids[@]:1}"); running=$((running-1))
         fi
     done
     for pid in "${pids[@]}"; do wait "$pid" 2>/dev/null || true; done
@@ -681,7 +672,7 @@ auto_heal_daemon() {
     check_root
     trap 'exit 0' INT TERM HUP
     while true; do
-        background_auto_heal
+        background_auto_heal || true
         sleep "$AUTO_HEAL_INTERVAL"
     done
 }
@@ -700,6 +691,273 @@ if [ "${1:-}" = "--auto-heal-daemon" ]; then
     exit 0
 fi
 
+
+# ================= V6.3.2 HEALTH / BRIDGE / PANEL SAFETY =================
+
+node_dir() { printf '%s\n' "$DATA_DIR/${1}_${2}"; }
+node_index_by_code() {
+    local wanted="${1^^}" idx c n p
+    for idx in "${ORDER[@]}"; do
+        IFS=":" read -r c n p <<< "${NODES[$idx]}"
+        [ "${c^^}" = "$wanted" ] && { printf "%s\n" "$idx"; return 0; }
+    done
+    return 1
+}
+
+node_state_file() { printf '%s/state.env\n' "$(node_dir "$1" "$2")"; }
+node_quarantine_file() { printf '%s/quarantine.env\n' "$(node_dir "$1" "$2")"; }
+
+state_set() {
+    local code="$1" port="$2" status="$3" ip="${4:-}" bootstrap="${5:-0}" reason="${6:-}"
+    local dir; dir=$(node_dir "$code" "$port"); mkdir -p "$dir"
+    umask 077
+    cat > "$(node_state_file "$code" "$port")" <<EOF
+STATUS=$(printf '%q' "$status")
+IP=$(printf '%q' "$ip")
+BOOTSTRAP=$(printf '%q' "$bootstrap")
+REASON=$(printf '%q' "$reason")
+UPDATED_AT=$(printf '%q' "$(date +%s)")
+EOF
+}
+
+state_get() {
+    local code="$1" port="$2" f; f=$(node_state_file "$code" "$port")
+    [ -r "$f" ] || return 1
+    # shellcheck disable=SC1090
+    source "$f" 2>/dev/null || return 1
+}
+
+quarantine_clear() {
+    rm -f "$(node_quarantine_file "$1" "$2")"
+}
+
+quarantine_record_failure() {
+    local code="$1" port="$2" reason="${3:-HEALTH_FAIL}" dir now fails delay
+    dir=$(node_dir "$code" "$port"); mkdir -p "$dir"
+    now=$(date +%s)
+    fails=0
+    if [ -r "$(node_quarantine_file "$code" "$port")" ]; then
+        # shellcheck disable=SC1090
+        source "$(node_quarantine_file "$code" "$port")" 2>/dev/null || true
+        fails=${FAIL_COUNT:-0}
+    fi
+    fails=$((fails+1))
+    delay=$QUARANTINE_BASE
+    if (( fails > 1 )); then delay=$(( QUARANTINE_BASE << (fails-1) )); fi
+    (( delay > QUARANTINE_MAX )) && delay=$QUARANTINE_MAX
+    umask 077
+    cat > "$(node_quarantine_file "$code" "$port")" <<EOF
+FAIL_COUNT=$fails
+UNTIL=$((now+delay))
+REASON=$(printf '%q' "$reason")
+EOF
+    state_set "$code" "$port" "QUARANTINED($fails)" "" 0 "$reason"
+}
+
+node_quarantine_active() {
+    local code="$1" port="$2" f now until
+    f=$(node_quarantine_file "$code" "$port")
+    [ -r "$f" ] || return 1
+    # shellcheck disable=SC1090
+    source "$f" 2>/dev/null || return 1
+    now=$(date +%s); until=${UNTIL:-0}
+    if (( until > now )); then return 0; fi
+    rm -f "$f"
+    return 1
+}
+
+ctrl_query() {
+    local port="$1" pass="$2" command="$3" timeout_sec="${4:-5}" out
+    out=$(timeout "$timeout_sec" bash -c '
+        exec 3<>/dev/tcp/127.0.0.1/"$0" || exit 10
+        printf "AUTHENTICATE \\\"%s\\\"\\r\\n%s\\r\\nQUIT\\r\\n" "$1" "$2" >&3
+        cat <&3
+    ' "$port" "$pass" "$command" 2>/dev/null || true)
+    printf '%s\n' "$out"
+}
+
+bootstrap_status() {
+    local code="$1" port="$2" inst_data_dir="$3" pass
+    local ctrl_file="$inst_data_dir/control.env"
+    [ -r "$ctrl_file" ] || { printf '0|NO_CONTROL_FILE'; return 0; }
+    # shellcheck disable=SC1090
+    source "$ctrl_file" 2>/dev/null || { printf '0|CONTROL_LOAD_FAIL'; return 0; }
+    local out progress tag
+    out=$(ctrl_query "$CTRL_PORT" "$CTRL_PASS" 'GETINFO status/bootstrap-phase' 4)
+    progress=$(printf '%s\n' "$out" | grep -oE 'PROGRESS=[0-9]+' | tail -n1 | cut -d= -f2)
+    tag=$(printf '%s\n' "$out" | grep -oE 'TAG=[^ ]+' | tail -n1 | cut -d= -f2)
+    progress=${progress:-0}; tag=${tag:-unknown}
+    printf '%s|%s\n' "$progress" "$tag"
+}
+
+bridge_available() { [ "$BRIDGE_MODE" = "1" ] && [ -s "$BRIDGE_FILE" ]; }
+
+bridge_validate() {
+    if [ "$BRIDGE_MODE" = "1" ]; then
+        command -v obfs4proxy >/dev/null 2>&1 || {
+            echo -e "${RED}[!] Bridge mode enabled but obfs4proxy is missing.${NC}"
+            return 1
+        }
+        [ -s "$BRIDGE_FILE" ] || {
+            echo -e "${RED}[!] Bridge mode enabled but $BRIDGE_FILE is empty.${NC}"
+            return 1
+        }
+    fi
+    return 0
+}
+
+compute_effective_parallel() {
+    EFFECTIVE_PARALLEL=$AUTO_HEAL_PARALLEL
+    if bridge_available; then
+        EFFECTIVE_PARALLEL=$BRIDGE_PARALLEL
+        if (( EFFECTIVE_PARALLEL < 1 )); then EFFECTIVE_PARALLEL=1; fi
+        if (( EFFECTIVE_PARALLEL > AUTO_HEAL_PARALLEL )); then EFFECTIVE_PARALLEL=$AUTO_HEAL_PARALLEL; fi
+    fi
+}
+
+panel_conf_write() {
+    mkdir -p "$BASE_DIR"; umask 077
+    cat > "$PANEL_CONF" <<EOF
+URL=$(printf '%q' "${URL:-}")
+USER=$(printf '%q' "${USER:-}")
+TOKEN=$(printf '%q' "${TOKEN:-}")
+PANEL_INBOUND_INDEX=${PANEL_INBOUND_INDEX:-1}
+PANEL_HOST_INDEX=${PANEL_HOST_INDEX:-0}
+PANEL_AUTO_SYNC=${PANEL_AUTO_SYNC:-1}
+EOF
+    chmod 600 "$PANEL_CONF"
+}
+
+panel_conf_safe_load() {
+    [ -r "$PANEL_CONF" ] || return 1
+    # shellcheck disable=SC1090
+    source "$PANEL_CONF" 2>/dev/null || return 1
+    return 0
+}
+
+panel_auth_preflight() {
+    panel_conf_safe_load || return 1
+    [ -n "${URL:-}" ] && [ -n "${TOKEN:-}" ] || return 1
+    local code
+    code=$(curl -4 -sk -o /dev/null -w '%{http_code}' --max-time 8 "$URL/api/nodes" -H "Authorization: Bearer $TOKEN" -H 'accept: application/json' 2>/dev/null || echo 000)
+    if [ "$code" = "401" ]; then
+        echo -e "${YELLOW}[!] Panel session expired (HTTP 401). Please login again from option 9.${NC}"
+        return 2
+    fi
+    [ "$code" != "000" ] || return 1
+    return 0
+}
+
+panel_core_fetch() {
+    local core_file="$1"; CORE_API_URL=""
+    local eps=(/api/admin/cores /api/cores /api/core /api/node/cores /api/admin/core)
+    local ep id resp extracted ids
+    : > "$core_file"
+    for ep in "${eps[@]}"; do
+        resp=$(curl -4 -sk --max-time 10 -X GET "$URL$ep/1" -H "Authorization: Bearer $TOKEN" -H 'accept: application/json' 2>/dev/null || true)
+        extracted=$(extract_json_from_response "$resp")
+        if [ -n "$extracted" ]; then printf '%s\n' "$extracted" > "$core_file"; CORE_API_URL="$URL$ep/1"; return 0; fi
+        resp=$(curl -4 -sk --max-time 10 -X GET "$URL$ep" -H "Authorization: Bearer $TOKEN" -H 'accept: application/json' 2>/dev/null || true)
+        ids=$(printf '%s' "$resp" | jq -r '.[].id // .data[].id // empty' 2>/dev/null | head -n1)
+        if [ -n "$ids" ]; then
+            id="$ids"
+            resp=$(curl -4 -sk --max-time 10 -X GET "$URL$ep/$id" -H "Authorization: Bearer $TOKEN" -H 'accept: application/json' 2>/dev/null || true)
+            extracted=$(extract_json_from_response "$resp")
+            if [ -n "$extracted" ]; then printf '%s\n' "$extracted" > "$core_file"; CORE_API_URL="$URL$ep/$id"; return 0; fi
+        fi
+    done
+    return 1
+}
+
+panel_validate_templates() {
+    local core_file="$1" hosts_file="$2" in_idx=$(( ${PANEL_INBOUND_INDEX:-1} - 1 )) host_idx=${PANEL_HOST_INDEX:-0}
+    local n
+    n=$(jq '.inbounds // [] | length' "$core_file" 2>/dev/null || echo 0)
+    if (( in_idx < 0 || in_idx >= n )); then
+        echo -e "${YELLOW}[!] Saved Panel inbound template is stale. Please reselect it.${NC}"
+        return 1
+    fi
+    local proto; proto=$(jq -r ".inbounds[$in_idx].protocol // \"\"" "$core_file")
+    [ -n "$proto" ] || return 1
+    if [ -n "$hosts_file" ] && [ -s "$hosts_file" ] && (( host_idx > 0 )); then
+        n=$(jq 'length' "$hosts_file" 2>/dev/null || echo 0)
+        if (( host_idx > n )); then
+            echo -e "${YELLOW}[!] Saved Panel host/SNI template is stale. Please reselect it.${NC}"
+            return 1
+        fi
+        local addr; addr=$(jq -r ".[$((host_idx-1))].address | if type==\"array\" and length>0 then .[0] elif type==\"string\" then . else \"\" end" "$hosts_file" 2>/dev/null || true)
+        [ -n "$addr" ] || { echo -e "${YELLOW}[!] Saved Panel host/SNI template has no usable address.${NC}"; return 1; }
+    fi
+    return 0
+}
+
+panel_load_hosts() {
+    local out="$1" resp
+    resp=$(curl -4 -sk --max-time 10 -X GET "$URL/api/hosts" -H "Authorization: Bearer $TOKEN" -H 'accept: application/json' 2>/dev/null || true)
+    if printf '%s' "$resp" | jq -e 'type=="array"' >/dev/null 2>&1; then printf '%s\n' "$resp" > "$out"; return 0; fi
+    printf '%s' "$resp" | jq -c '.data // []' > "$out" 2>/dev/null
+}
+
+panel_prepare_templates() {
+    panel_auth_preflight || return $?
+    local core_file="$BASE_DIR/remote_core.json" hosts_file="$BASE_DIR/panel_hosts.json"
+    panel_core_fetch "$core_file" || { echo -e "${RED}[!] Could not locate a panel Core API.${NC}"; return 1; }
+    panel_load_hosts "$hosts_file"
+    panel_validate_templates "$core_file" "$hosts_file" 2>/dev/null || true
+    local in_count; in_count=$(jq '.inbounds | length' "$core_file" 2>/dev/null || echo 0)
+    echo -e "${CYAN}Select inbound template:${NC}"
+    local i tag port proto
+    for ((i=0;i<in_count;i++)); do
+        tag=$(jq -r ".inbounds[$i].tag // \"\"" "$core_file"); port=$(jq -r ".inbounds[$i].port // \"\"" "$core_file"); proto=$(jq -r ".inbounds[$i].protocol // \"\"" "$core_file")
+        printf '  [%02d] %-10s port=%-6s %s\n' "$((i+1))" "$proto" "$port" "$tag"
+    done
+    read -r -p 'Inbound template: ' PANEL_INBOUND_INDEX < /dev/tty || return 1
+    [[ "$PANEL_INBOUND_INDEX" =~ ^[0-9]+$ ]] || return 1
+    local host_count; host_count=$(jq 'length' "$hosts_file" 2>/dev/null || echo 0)
+    PANEL_HOST_INDEX=0
+    if (( host_count > 0 )); then
+        echo -e "${CYAN}Select host/SNI template (0=derive from inbound):${NC}"
+        for ((i=0;i<host_count;i++)); do
+            local rem addr; rem=$(jq -r ".[$i].remark // \"\"" "$hosts_file"); addr=$(jq -r ".[$i].address | if type==\"array\" and length>0 then .[0] elif type==\"string\" then . else \"\" end" "$hosts_file")
+            printf '  [%02d] %-24s %s\n' "$((i+1))" "$rem" "$addr"
+        done
+        read -r -p 'Host template [0]: ' PANEL_HOST_INDEX < /dev/tty || return 1
+        [[ "$PANEL_HOST_INDEX" =~ ^[0-9]+$ ]] || return 1
+    fi
+    PANEL_AUTO_SYNC=1
+    panel_conf_write
+    echo -e "${GREEN}[+] Panel templates saved securely (chmod 600, password not stored).${NC}"
+}
+
+panel_delete_node_ids() {
+    panel_auth_preflight || return $?
+    local core_file="$BASE_DIR/remote_core.json" hosts_file="$BASE_DIR/panel_hosts.json"
+    panel_core_fetch "$core_file" || return 1
+    panel_load_hosts "$hosts_file"
+    local tmp="$BASE_DIR/panel_core_delete.tmp.json" idx code name out_port safe in_prefix out_tag
+    local pattern_file="$BASE_DIR/panel_delete_patterns.txt"; : > "$pattern_file"
+    for idx in "$@"; do IFS=':' read -r code name out_port <<< "${NODES[$idx]}"; safe=$(printf '%s' "$name" | tr -d ' ' | tr -cd 'a-zA-Z0-9-'); printf '%s|%s|%s\n' "$code" "$safe" "$out_port" >> "$pattern_file"; done
+    jq --slurpfile patterns <(jq -R 'split("|")' "$pattern_file" | jq -s '.') '
+      def hit($tag): any($patterns[0][]; . as $p | ((($tag // "") | startswith($p[0] + "-" + $p[1] + "-IN-")) or (($tag // "") == ($p[0] + "-" + $p[1] + "-OUT-" + $p[2]))));
+      .inbounds = [(.inbounds // [])[] | select(hit(.tag)|not)] |
+      .outbounds = [(.outbounds // [])[] | select(hit(.tag)|not)] |
+      .routing.rules = [(.routing.rules // [])[] | select((hit(.outboundTag // "")) and false or (((.inboundTag // []) | map(hit(.)) | any) or hit(.outboundTag // "")) | not)]
+    ' "$core_file" > "$tmp" 2>/dev/null || return 1
+    mv -f "$tmp" "$core_file"
+    local original; original=$(curl -4 -sk --max-time 10 -X GET "$CORE_API_URL" -H "Authorization: Bearer $TOKEN" -H 'accept: application/json' 2>/dev/null || true)
+    local obj; obj=$(printf '%s' "$original" | jq -r 'if type=="object" and has("data") then .data else . end')
+    jq --slurpfile conf "$core_file" 'if .config!=null then .config=$conf[0] elif .xray_config!=null then .xray_config=$conf[0] elif .content!=null then .content=$conf[0] else .config=$conf[0] end' <<< "$obj" > "$BASE_DIR/panel_delete_payload.json"
+    local code_http; code_http=$(curl -4 -sk -o /dev/null -w '%{http_code}' -X PUT "$CORE_API_URL" -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' -d @"$BASE_DIR/panel_delete_payload.json" 2>/dev/null || echo 000)
+    [[ "$code_http" == 2* ]] || { echo -e "${RED}[!] Panel core delete failed (HTTP $code_http).${NC}"; return 1; }
+    if [ -s "$hosts_file" ]; then
+        jq --slurpfile patterns <(jq -R 'split("|")' "$pattern_file" | jq -s '.') '[.[] | select(((.inbound_tag // "") as $t | any($patterns[0][]; . as $p | ($t | startswith($p[0] + "-" + $p[1] + "-IN-")))) | not)]' "$hosts_file" > "$BASE_DIR/panel_hosts_filtered.json" || return 1
+        code_http=$(curl -4 -sk -o /dev/null -w '%{http_code}' -X PUT "$URL/api/hosts" -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' -d @"$BASE_DIR/panel_hosts_filtered.json" 2>/dev/null || echo 000)
+        [[ "$code_http" == 2* ]] || echo -e "${YELLOW}[!] Host delete returned HTTP $code_http.${NC}"
+    fi
+    rm -f "$pattern_file" "$BASE_DIR/panel_delete_payload.json" "$BASE_DIR/panel_hosts_filtered.json"
+    echo -e "${GREEN}[+] Selected node(s) removed from Panel configuration.${NC}"
+}
+
 # ================= UI FUNCTIONS =================
 
 draw_header() {
@@ -711,7 +969,7 @@ draw_header() {
     echo -e "${MAGENTA} ║${CYAN}   ╚════██║██╔══██║██╔══╝  ██╔══██╗██║     ██║   ██║██║   ██║██╔═██╗ ${MAGENTA} ║${NC}"
     echo -e "${MAGENTA} ║${CYAN}   ███████║██║  ██║███████╗██║  ██║███████╗╚██████╔╝╚██████╔╝██║  ██╗${MAGENTA} ║${NC}"
     echo -e "${MAGENTA} ║${CYAN}   ╚══════╝╚═╝  ╚═╝╚══════╝╚═╝  ╚═╝╚══════╝ ╚═════╝  ╚═════╝ ╚═╝  ╚═╝${MAGENTA} ║${NC}"
-    echo -e "${MAGENTA} ║${YELLOW}          A U T O M A T E   E N G I N E   V 6 . 1                   ${MAGENTA}║${NC}"
+    echo -e "${MAGENTA} ║${YELLOW}          A U T O M A T E   E N G I N E   V 6 . 3 . 2                   ${MAGENTA}║${NC}"
     echo -e "${MAGENTA} ╚════════════════════════════════════════════════════════╝${NC}"
     echo ""
 }
@@ -819,6 +1077,7 @@ EOF
                 printf '%s\n' "$public_ip" > "$ip_file"
                 echo -e "${GREEN}[+] FALLBACK VERIFIED: $public_ip → label=$code/$name route=$route_code${NC}"
                 echo -e "${GREEN}[+] Online -> ${WHITE}$code - $name ${GREEN}($public_ip)${NC}\n"
+                if panel_conf_safe_load && [ "${PANEL_AUTO_SYNC:-0}" = "1" ]; then panel_sync_single "$(node_index_by_code "$code")" >/dev/null 2>&1 || true; fi
                 return 0
             else
                 echo -e "${CYAN}[*] Verifying ${MAGENTA}$public_ip${CYAN} against GeoIP sources for ${WHITE}$route_code${CYAN}...${NC}"
@@ -831,6 +1090,7 @@ EOF
                     echo -e "${GREEN}[+] VERIFIED: $public_ip → label=$code/$name route=$route_code${NC}"
                     echo -e "${GREEN}[+] GeoIP sources: ${seen_ccs}${NC}"
                     echo -e "${GREEN}[+] Online -> ${WHITE}$code - $name ${GREEN}($public_ip)${NC}\n"
+                    if panel_conf_safe_load && [ "${PANEL_AUTO_SYNC:-0}" = "1" ]; then panel_sync_single "$(node_index_by_code "$code")" >/dev/null 2>&1 || true; fi
                     return 0
                 fi
 
@@ -1143,7 +1403,7 @@ install_engine() {
     apt-get update -qq
     echo -e "${YELLOW}[*] Installing prerequisites...${NC}"
     DEBIAN_FRONTEND=noninteractive apt-get install -y \
-        tor tor-geoipdb curl jq nano openssl unzip zip cron ca-certificates util-linux
+        tor tor-geoipdb obfs4proxy curl jq nano openssl unzip zip cron ca-certificates util-linux
 
     systemctl stop tor 2>/dev/null || true
     systemctl disable tor 2>/dev/null || true
@@ -1190,64 +1450,26 @@ EOF
 }
 
 update_system() {
-    check_root
-    draw_header
-    echo -e "${CYAN}[*] Sherlook Update — current v${SHERLOOK_VERSION}${NC}"
-
-    local tmp tmp_installer remote_version
-    tmp=$(mktemp /tmp/sherlook_update.XXXXXX) || return 1
-    tmp_installer=$(mktemp /tmp/sherlook_installer_update.XXXXXX) || { rm -f "$tmp"; return 1; }
-    if ! curl -4 -fL --retry 5 --retry-delay 1 --connect-timeout 10 --max-time 60 \
-        -o "$tmp" "$RAW_ENGINE_URL"; then
-        echo -e "${RED}[!] Update download failed.${NC}"
-        rm -f "$tmp" "$tmp_installer"
-        return 1
+    check_root; draw_header
+    if [ "$PINNED_COMMIT" = "__INSTALLER_RESOLVES__" ] || [ -z "$PINNED_COMMIT" ]; then
+        echo -e "${YELLOW}[!] This runtime is not pinned yet. Re-run install-sherlook to establish a pinned commit.${NC}"; return 1
     fi
-
-    if ! head -n1 "$tmp" | grep -q '^#!'; then
-        echo -e "${RED}[!] Remote payload is not a shell script; refusing update.${NC}"
-        rm -f "$tmp" "$tmp_installer"
-        return 1
+    echo -e "${CYAN}[*] Repairing Sherlook from pinned commit:${NC} $PINNED_COMMIT"
+    local tmp backup
+    tmp=$(mktemp /tmp/sherlook_pinned.XXXXXX) || return 1
+    if ! curl -4 -fsSL --connect-timeout 10 --max-time 90 -o "$tmp" "https://raw.githubusercontent.com/SherlookHolmz/multi/$PINNED_COMMIT/sherlook.sh"; then
+        rm -f "$tmp"; echo -e "${RED}[!] Pinned source download failed.${NC}"; return 1
     fi
-    if ! bash -n "$tmp"; then
-        echo -e "${RED}[!] Remote script failed bash syntax validation; refusing update.${NC}"
-        rm -f "$tmp" "$tmp_installer"
-        return 1
-    fi
-
-    if curl -4 -fL --retry 3 --connect-timeout 10 --max-time 60 -o "$tmp_installer" "$RAW_INSTALLER_URL" 2>/dev/null; then
-        if ! head -n1 "$tmp_installer" | grep -q '^#!' || ! bash -n "$tmp_installer"; then
-            rm -f "$tmp_installer"
-            tmp_installer=""
-        fi
-    else
-        rm -f "$tmp_installer"
-        tmp_installer=""
-    fi
-
-    remote_version=$(grep -m1 '^SHERLOOK_VERSION=' "$tmp" | sed -E 's/^SHERLOOK_VERSION="([^"]+)"/\1/' || true)
-    [ -n "$remote_version" ] || remote_version="unknown"
-    echo -e "${GREEN}[+] Remote version: ${remote_version}${NC}"
-
-    local backup="$BASE_DIR/sherlook.sh.bak.$(date +%Y%m%d_%H%M%S)"
-    mkdir -p "$BASE_DIR" /root/.sherlook
-    if [ -f "$INSTALL_PATH" ]; then cp -a "$INSTALL_PATH" "$backup"; fi
-
-    install -m 755 "$tmp" "$INSTALL_PATH.new"
-    mv -f "$INSTALL_PATH.new" "$INSTALL_PATH"
+    head -n1 "$tmp" | grep -q '^#!' || { rm -f "$tmp"; echo -e "${RED}[!] Invalid pinned payload.${NC}"; return 1; }
+    bash -n "$tmp" || { rm -f "$tmp"; echo -e "${RED}[!] Pinned source failed syntax validation.${NC}"; return 1; }
+    grep -q 'SHERLOOK_VERSION="6.3.2"' "$tmp" || { rm -f "$tmp"; echo -e "${RED}[!] Pinned source is not the expected 6.3.2 engine.${NC}"; return 1; }
+    backup="$BASE_DIR/sherlook.sh.bak.$(date +%Y%m%d_%H%M%S)"; mkdir -p "$BASE_DIR" /root/.sherlook
+    [ -f "$INSTALL_PATH" ] && cp -a "$INSTALL_PATH" "$backup"
+    install -m 755 "$tmp" "$INSTALL_PATH.new" && mv -f "$INSTALL_PATH.new" "$INSTALL_PATH"
     install -m 755 "$tmp" /root/.sherlook/sherlook.sh
     rm -f "$tmp"
-    if [ -n "$tmp_installer" ] && [ -f "$tmp_installer" ]; then
-        install -m 755 "$tmp_installer" /root/.sherlook/install.sh
-        install -m 755 "$tmp_installer" /usr/local/bin/sherlook-install
-    fi
-    rm -f "$tmp_installer"
-
-    systemctl daemon-reload 2>/dev/null || true
+    echo -e "${GREEN}[+] Pinned repair completed atomically. Backup: $backup${NC}"
     systemctl restart sherlook-heal.service 2>/dev/null || true
-
-    echo -e "${GREEN}[+] Update installed atomically. Backup: $backup${NC}"
-    echo -e "${YELLOW}[*] Restarting Sherlook with the new engine...${NC}"
     exec "$INSTALL_PATH"
 }
 
@@ -1468,184 +1690,61 @@ bulk_add_nodes() {
 view_active_nodes() {
     check_root
     while true; do
-        draw_header
-        sync_dynamic_locations
+        draw_header; sync_dynamic_locations
         echo -e "${CYAN}» Option 6 - Active Nodes Monitor${NC}"
-        echo -e "${YELLOW}[*] Health daemon checks every ${AUTO_HEAL_INTERVAL}s. This screen only reads current state.${NC}\n"
-        echo -e "${BLUE}┌──────┬──────┬──────────────────────┬─────────────┬──────────────┬──────────────────┐${NC}"
-        echo -e "${BLUE}│${WHITE} ID   ${BLUE}│${WHITE} CC   ${BLUE}│${WHITE} Location             ${BLUE}│${WHITE} Tor Port    ${BLUE}│${WHITE} Status       ${BLUE}│${WHITE} Live IP          ${BLUE}│${NC}"
-        echo -e "${BLUE}├──────┼──────┼──────────────────────┼─────────────┼──────────────┼──────────────────┤${NC}"
-
-        local found=0 idx details code name out_port display_ip status
+        echo -e "${YELLOW}[*] Live network checks run in the background; this screen reads cached health state.${NC}\n"
+        printf '%-5s %-4s %-22s %-8s %-20s %-18s\n' 'ID' 'CC' 'Location' 'PORT' 'STATUS' 'IP'
+        echo '────────────────────────────────────────────────────────────────────────────'
+        local idx code name out_port status ip bootstrap reason
         for idx in "${ORDER[@]}"; do
-            details="${NODES[$idx]}"
-            IFS=':' read -r code name out_port <<< "$details"
+            IFS=':' read -r code name out_port <<< "${NODES[$idx]}"
             [ -f "$BASE_DIR/node_${code}_${out_port}.conf" ] || continue
-            found=1
-            display_ip="Waiting..."
-            local ip_file="$DATA_DIR/${code}_${out_port}/last_ip.txt"
-            [ -s "$ip_file" ] && is_valid_ipv4 "$(head -n1 "$ip_file" | tr -d '\r\n')" && display_ip=$(head -n1 "$ip_file" | tr -d '\r\n')
-            if node_process_running "$code" "$out_port"; then status="ONLINE"; else status="HEALING"; fi
-            if [ "$status" = "ONLINE" ]; then
-                printf "${BLUE}│ ${CYAN}%-4s ${BLUE}│ ${WHITE}%-4s ${BLUE}│ ${WHITE}%-20s ${BLUE}│ ${MAGENTA}%-11s ${BLUE}│ ${GREEN}%-12s ${BLUE}│ ${GREEN}%-16s ${BLUE}│${NC}\n" "$idx" "$code" "$name" "$out_port" "$status" "$display_ip"
-            else
-                printf "${BLUE}│ ${CYAN}%-4s ${BLUE}│ ${WHITE}%-4s ${BLUE}│ ${WHITE}%-20s ${BLUE}│ ${MAGENTA}%-11s ${BLUE}│ ${YELLOW}%-12s ${BLUE}│ ${YELLOW}%-16s ${BLUE}│${NC}\n" "$idx" "$code" "$name" "$out_port" "$status" "$display_ip"
-            fi
+            status='UNKNOWN'; ip='-'; bootstrap='-'; reason='-'
+            if state_get "$code" "$out_port"; then status="${STATUS:-UNKNOWN}"; ip="${IP:-${ip}}"; bootstrap="${BOOTSTRAP:-0}%"; reason="${REASON:-}"; fi
+            printf '[%02s] %-4s %-22s %-8s %-20s %-18s\n' "$idx" "$code" "$name" "$out_port" "$status" "$ip"
         done
-        [ "$found" -eq 0 ] && printf "${BLUE}│ ${YELLOW}%-82s ${BLUE}│${NC}\n" "No installed nodes found."
-        echo -e "${BLUE}└──────┴──────┴──────────────────────┴─────────────┴──────────────┴──────────────────┘${NC}\n"
-        echo -e "${MAGENTA}[ Continuous Health Monitor ]${NC} Refreshes every 3 seconds. Press any key to return."
-        if read -t 3 -n 1 -s key; then break; fi
+        echo '────────────────────────────────────────────────────────────────────────────'
+        echo "Bootstrap/Reason is stored in node state and refreshed by Auto-Heal."
+        echo 'Press any key to return.'
+        read -t 3 -n 1 -s _key && break || true
     done
 }
 
 edit_delete_nodes() {
     check_root
-
     parse_node_selection() {
-        local input="$1" token a b n idx
-        local -a result=()
-        declare -A seen=()
-        input="${input// /}"
-        input="${input//;/,}"
-        IFS=',' read -ra tokens <<< "$input"
+        local input="$1" token a b n idx; local -a result=(); declare -A seen=()
+        input="${input// /}"; input="${input//;/,}"; IFS=',' read -ra tokens <<< "$input"
         for token in "${tokens[@]}"; do
             [ -z "$token" ] && continue
             if [[ "$token" =~ ^([0-9]+)-([0-9]+)$ ]]; then
-                a=$((10#${BASH_REMATCH[1]})); b=$((10#${BASH_REMATCH[2]}))
-                if (( a > b )); then n=$a; a=$b; b=$n; fi
-                for ((n=a; n<=b; n++)); do
-                    idx=$(printf '%02d' "$n")
-                    if [[ -n "${NODES[$idx]:-}" && -z "${seen[$idx]:-}" ]]; then
-                        result+=("$idx"); seen[$idx]=1
-                    fi
-                done
+                a=$((10#${BASH_REMATCH[1]})); b=$((10#${BASH_REMATCH[2]})); ((a>b)) && { n=$a; a=$b; b=$n; }
+                for ((n=a;n<=b;n++)); do idx=$(printf '%02d' "$n"); [[ -n "${NODES[$idx]:-}" && -z "${seen[$idx]:-}" ]] && result+=("$idx") && seen[$idx]=1; done
             elif [[ "$token" =~ ^[0-9]+$ ]]; then
-                idx=$(printf '%02d' "$((10#$token))")
-                if [[ -n "${NODES[$idx]:-}" && -z "${seen[$idx]:-}" ]]; then
-                    result+=("$idx"); seen[$idx]=1
-                fi
+                idx=$(printf '%02d' "$((10#$token))"); [[ -n "${NODES[$idx]:-}" && -z "${seen[$idx]:-}" ]] && result+=("$idx") && seen[$idx]=1
             fi
         done
         printf '%s\n' "${result[@]}"
     }
-
-    delete_node_ids() {
-        local idx code name out_port
-        local -a ids=("$@")
-        for idx in "${ids[@]}"; do
-            IFS=':' read -r code name out_port <<< "${NODES[$idx]}"
-            echo -e "${YELLOW}[*] Removing $idx ${EMOJIS[$code]} $name...${NC}"
-            pkill -9 -f "node_${code}_${out_port}\\.conf" 2>/dev/null || true
-            rm -f "$BASE_DIR/node_${code}_${out_port}.conf"
-            rm -rf "$DATA_DIR/${code}_${out_port}" 2>/dev/null || true
-            echo -e "${GREEN}  ✓ $idx removed${NC}"
-        done
-    }
-
-    repair_node_ids() {
-        local idx code name out_port jobs=0 max_jobs=6 total=0
-        local -a ids=("$@") pids=()
-        for idx in "${ids[@]}"; do
-            IFS=':' read -r code name out_port <<< "${NODES[$idx]}"
-            [ -f "$BASE_DIR/node_${code}_${out_port}.conf" ] || continue
-            total=$((total+1))
-            rotate_one_node "$code" "$name" "$out_port" 0 &
-            pids+=("$!")
-            jobs=$((jobs+1))
-            if (( jobs >= max_jobs )); then
-                wait "${pids[0]}" 2>/dev/null || true
-                pids=("${pids[@]:1}")
-                jobs=$((jobs-1))
-            fi
-        done
-        for pid in "${pids[@]}"; do wait "$pid" 2>/dev/null || true; done
-        echo -e "${GREEN}[+] Repair/rebuild completed for $total node(s). Each node had up to $NODE_ROTATE_RETRIES real attempts.${NC}"
-    }
-
+    delete_local_ids() { local idx code name out_port; for idx in "$@"; do IFS=':' read -r code name out_port <<< "${NODES[$idx]}"; pkill -9 -f "node_${code}_${out_port}\.conf" 2>/dev/null || true; rm -f "$BASE_DIR/node_${code}_${out_port}.conf"; rm -rf "$DATA_DIR/${code}_${out_port}"; done; }
+    repair_ids() { compute_effective_parallel; local max_jobs=$EFFECTIVE_PARALLEL jobs=0; local -a pids=(); local idx code name out_port; for idx in "$@"; do IFS=':' read -r code name out_port <<< "${NODES[$idx]}"; [ -f "$BASE_DIR/node_${code}_${out_port}.conf" ] || continue; rotate_one_node "$code" "$name" "$out_port" 0 & pids+=("$!"); jobs=$((jobs+1)); if ((jobs>=max_jobs)); then wait "${pids[0]}" 2>/dev/null || true; pids=("${pids[@]:1}"); jobs=$((jobs-1)); fi; done; for pid in "${pids[@]}"; do wait "$pid" 2>/dev/null || true; done; }
     while true; do
-        draw_header
-        echo -e "📌 ${MAGENTA}[ NODE MAINTENANCE / AUTO-REPAIR ]${NC}"
-        echo -e "${BLUE}────────────────────────────────────────────────────────────────────────${NC}"
-        echo -e "  ${CYAN}ID   COUNTRY              TorPort     STATUS${NC}"
-        echo -e "${BLUE}────────────────────────────────────────────────────────────────────────${NC}"
-
-        local active_nodes=() idx code name out_port status ip_file ip
-        for idx in "${ORDER[@]}"; do
-            IFS=':' read -r code name out_port <<< "${NODES[$idx]}"
-            [ -f "$BASE_DIR/node_${code}_${out_port}.conf" ] || continue
-            active_nodes+=("$idx")
-            ip_file="$DATA_DIR/${code}_${out_port}/last_ip.txt"
-            ip=""
-            [ -s "$ip_file" ] && ip=$(head -n1 "$ip_file" | tr -d '\r\n')
-            if node_process_running "$code" "$out_port" && is_valid_ipv4 "$ip"; then
-                status="${GREEN}ONLINE${NC}"
-            elif node_process_running "$code" "$out_port"; then
-                status="${YELLOW}HEALING${NC}"
-            else
-                status="${RED}DEAD${NC}"
-            fi
-            printf "  ${CYAN}[%s]${NC} %-20s ${MAGENTA}%-8s${NC} %b\n" "$idx" "$name" "$out_port" "$status"
-        done
-
-        if [ ${#active_nodes[@]} -eq 0 ]; then
-            echo -e "  ${RED}No installed nodes found.${NC}"
-        fi
-        echo -e "${BLUE}────────────────────────────────────────────────────────────────────────${NC}"
-        echo -e "  ${GREEN}[1]${NC} Repair/Rebuild selected nodes ${WHITE}(e.g. 02,04,06 or 2,4,6 or 2-6)${NC}"
-        echo -e "  ${RED}[2]${NC} Delete selected nodes ${WHITE}(same multi-selection syntax)${NC}"
-        echo -e "  ${YELLOW}[3]${NC} Auto-repair ALL DEAD/HEALING nodes"
-        echo -e "  ${CYAN}[4]${NC} Refresh health/status"
-        echo -e "  ${RED}[0]${NC} Back"
-        echo -e "${BLUE}────────────────────────────────────────────────────────────────────────${NC}"
-
-        local action selection
-        read -r -p "Select action: " action < /dev/tty || return
+        draw_header; echo -e "📌 ${MAGENTA}[ NODE MAINTENANCE ]${NC}"; echo '────────────────────────────────────────────────────────────'
+        local idx code name out_port st
+        for idx in "${ORDER[@]}"; do IFS=':' read -r code name out_port <<< "${NODES[$idx]}"; [ -f "$BASE_DIR/node_${code}_${out_port}.conf" ] || continue; st='UNKNOWN'; state_get "$code" "$out_port" && st="$STATUS"; printf '[%02s] %-20s %-8s %s\n' "$idx" "$name" "$out_port" "$st"; done
+        echo '────────────────────────────────────────────────────────────'
+        echo '[1] Repair selected       [2] Delete local selected'
+        echo '[3] Delete local + Panel  [4] Refresh'
+        echo '[0] Back'
+        read -r -p 'Select action: ' action < /dev/tty || return
         case "$action" in
-            1)
-                read -r -p "Node IDs: " selection < /dev/tty || continue
-                mapfile -t selected < <(parse_node_selection "$selection")
-                if [ ${#selected[@]} -eq 0 ]; then
-                    echo -e "${RED}[!] No valid node IDs selected.${NC}"
-                else
-                    repair_node_ids "${selected[@]}"
-                fi
-                read -r -p "Press Enter..." < /dev/tty
-                ;;
-            2)
-                read -r -p "Node IDs: " selection < /dev/tty || continue
-                mapfile -t selected < <(parse_node_selection "$selection")
-                if [ ${#selected[@]} -eq 0 ]; then
-                    echo -e "${RED}[!] No valid node IDs selected.${NC}"
-                else
-                    echo -e "${RED}[!] This will permanently remove ${#selected[@]} node(s).${NC}"
-                    read -r -p "Confirm (yes/no): " confirm < /dev/tty
-                    if [ "$confirm" = "yes" ]; then
-                        delete_node_ids "${selected[@]}"
-                    else
-                        echo -e "${YELLOW}[-] Cancelled.${NC}"
-                    fi
-                fi
-                read -r -p "Press Enter..." < /dev/tty
-                ;;
-            3)
-                local -a dead_ids=()
-                for idx in "${active_nodes[@]}"; do
-                    IFS=':' read -r code name out_port <<< "${NODES[$idx]}"
-                    ip_file="$DATA_DIR/${code}_${out_port}/last_ip.txt"
-                    ip=""
-                    [ -s "$ip_file" ] && ip=$(head -n1 "$ip_file" | tr -d '\r\n')
-                    if ! node_process_running "$code" "$out_port" || ! is_valid_ipv4 "$ip"; then
-                        dead_ids+=("$idx")
-                    fi
-                done
-                if [ ${#dead_ids[@]} -eq 0 ]; then
-                    echo -e "${GREEN}[+] No DEAD/HEALING nodes require repair.${NC}"
-                else
-                    echo -e "${YELLOW}[*] Auto-repairing: ${dead_ids[*]}${NC}"
-                    repair_node_ids "${dead_ids[@]}"
-                fi
-                read -r -p "Press Enter..." < /dev/tty
+            1|2|3)
+                read -r -p 'Node IDs (e.g. 1-21,25): ' selection < /dev/tty || continue
+                mapfile -t selected < <(parse_node_selection "$selection"); [ ${#selected[@]} -gt 0 ] || { echo '[!] No valid IDs.'; sleep 1; continue; }
+                if [ "$action" = 1 ]; then repair_ids "${selected[@]}"; fi
+                if [ "$action" = 2 ]; then read -r -p 'Type DELETE to confirm: ' c < /dev/tty; [ "$c" = DELETE ] && delete_local_ids "${selected[@]}"; fi
+                if [ "$action" = 3 ]; then read -r -p 'Type DELETE to confirm local+panel removal: ' c < /dev/tty; if [ "$c" = DELETE ]; then panel_delete_node_ids "${selected[@]}" || true; delete_local_ids "${selected[@]}"; fi; fi
+                read -r -p 'Press Enter...' < /dev/tty
                 ;;
             4) continue ;;
             0) return ;;
@@ -1657,70 +1756,42 @@ edit_delete_nodes() {
 
 panel_login() {
     draw_header
-    echo -e "⏳ ${CYAN}Connecting to Nexatis panel...${NC}"
-
-    if [ -f "$PANEL_CONF" ]; then
-        source "$PANEL_CONF" 2>/dev/null || true
-        if [ -n "$URL" ] && [ -n "$TOKEN" ]; then
-            echo -e "\n${GREEN}[+] Saved session found:${NC} ${WHITE}$URL${NC}"
-            read -p "$(echo -e ${CYAN}"❓ Do you want to use the saved session? (Y/n): "${NC})" use_saved
-            if [[ -z "$use_saved" || "${use_saved,,}" == "y" ]]; then
-                echo -e "${GREEN}🟢 Login resumed successfully!${NC}"
-                sleep 1
-                panel_menu
-                return
-            fi
-        fi
+    if panel_conf_safe_load && [ -n "${URL:-}" ] && [ -n "${TOKEN:-}" ]; then
+        if panel_auth_preflight; then panel_menu; return; fi
     fi
-
-    echo -e "${YELLOW}[~] Detecting panel URL...${NC}"
-    read -p "$(echo -e "  Panel domain (e.g. panel.example.com) []: ")" p_domain
-    read -p "$(echo -e "  Panel port (e.g. 8443) []: ")" p_port
-
-    local base_url="https://${p_domain}:${p_port}"
-
-    read -p "  Admin username: " p_user
-    read -s -p "  Admin password: " p_pass
-    echo ""
-
-    mkdir -p "$BASE_DIR"
-    echo "URL=$base_url" > "$PANEL_CONF"
-    echo "USER=$p_user" >> "$PANEL_CONF"
-    echo "PASS=$p_pass" >> "$PANEL_CONF"
-
-    echo -e "${YELLOW}[~] Logging in...${NC}"
-    local token_resp=$(curl -s -X POST "$base_url/api/admin/token" \
-        -d "grant_type=password&username=$p_user&password=$p_pass" | tr -d '\0')
-    local token=$(echo "$token_resp" | jq -r '.access_token' 2>/dev/null || echo "null")
-
-    if [ "$token" == "null" ] || [ -z "$token" ]; then
-        echo -e "${RED}[!] Login failed. Ensure details are correct.${NC}"; sleep 2
-    else
-        echo "TOKEN=$token" >> "$PANEL_CONF"
-        echo -e "${GREEN}🟢 Login successful!${NC}"
-        sleep 1
-        panel_menu
-    fi
+    local p_domain p_port p_user p_pass base_url token_resp token
+    read -r -p 'Panel domain: ' p_domain < /dev/tty || return
+    read -r -p 'Panel port [443]: ' p_port < /dev/tty || return; [ -n "$p_port" ] || p_port=443
+    base_url="https://${p_domain}:${p_port}"
+    read -r -p 'Admin username: ' p_user < /dev/tty || return
+    read -r -s -p 'Admin password: ' p_pass < /dev/tty || return; echo
+    token_resp=$(curl -4 -sk --max-time 15 -X POST "$base_url/api/admin/token" -d "grant_type=password&username=$p_user&password=$p_pass" 2>/dev/null || true)
+    token=$(printf '%s' "$token_resp" | jq -r '.access_token // empty' 2>/dev/null)
+    unset p_pass token_resp
+    [ -n "$token" ] || { echo -e "${RED}[!] Login failed.${NC}"; return 1; }
+    URL="$base_url"; USER="$p_user"; TOKEN="$token"; PANEL_INBOUND_INDEX=${PANEL_INBOUND_INDEX:-1}; PANEL_HOST_INDEX=${PANEL_HOST_INDEX:-0}; PANEL_AUTO_SYNC=1
+    panel_conf_write
+    echo -e "${GREEN}[+] Login successful. Password was not stored.${NC}"
+    panel_menu
 }
 
 panel_menu() {
     while true; do
         draw_header
         echo -e "📌 ${MAGENTA}[ NEXATIS CONTROL PANEL ]${NC}"
-        echo -e "${BLUE}=============================================${NC}"
-        echo -e "  ${GREEN}[1]${NC} Auto-Extract Panel Configurations"
-        echo -e "  ${RED}[2]${NC} Logout (Exit Panel)"
-        echo -e "  ${YELLOW}[0]${NC} Return to Main Menu"
-        echo -e "${BLUE}=============================================${NC}\n"
-        read -p "$(echo -e ${CYAN}"Selected option: "${NC})" panel_opt
-
-        if [ "$panel_opt" == "0" ]; then
-            break
-        elif [ "$panel_opt" == "2" ]; then
-            rm -f "$PANEL_CONF"; break
-        elif [ "$panel_opt" == "1" ]; then
-            panel_batch_create
-        fi
+        echo '[1] Configure/validate templates'
+        echo '[2] Add installed nodes to Panel'
+        echo '[3] Delete selected nodes from Panel'
+        echo '[4] Logout'
+        echo '[0] Back'
+        read -r -p 'Selected option: ' panel_opt < /dev/tty || return
+        case "$panel_opt" in
+            1) panel_prepare_templates; read -r -p 'Press Enter...' < /dev/tty ;;
+            2) panel_batch_create ;;
+            3) read -r -p 'Node IDs: ' s < /dev/tty || continue; mapfile -t ids < <(printf '%s\n' "$s" | sed 's/;/,/g' | awk -F',' '{for(i=1;i<=NF;i++) print $i}' | while read -r x; do if [[ "$x" =~ ^([0-9]+)-([0-9]+)$ ]]; then for ((n=BASH_REMATCH[1];n<=BASH_REMATCH[2];n++)); do printf "%02d\n" "$n"; done; else [[ "$x" =~ ^[0-9]+$ ]] && printf "%02d\n" "$x"; fi; done | sort -u); [ ${#ids[@]} -gt 0 ] && panel_delete_node_ids "${ids[@]}"; read -r -p 'Press Enter...' < /dev/tty ;;
+            4) rm -f "$PANEL_CONF"; unset URL USER TOKEN; echo '[+] Logged out.'; return ;;
+            0) return ;;
+        esac
     done
 }
 
@@ -1735,6 +1806,46 @@ extract_json_from_response() {
     fi
     echo ""
 }
+
+
+panel_sync_single() {
+    local idx="$1" code name out_port
+    IFS=':' read -r code name out_port <<< "${NODES[$idx]}"
+    panel_auth_preflight || return $?
+    local core_file="$BASE_DIR/remote_core.json" hosts_file="$BASE_DIR/panel_hosts.json"
+    panel_core_fetch "$core_file" || return 1
+    panel_load_hosts "$hosts_file"
+    panel_validate_templates "$core_file" "$hosts_file" || return 2
+    local in_idx=$((PANEL_INBOUND_INDEX-1)) clone_inbound_json clone_tag clone_sec rand_port in_tag out_tag safe_name new_remark cloned_sni='' clone_host_json='{}'
+    clone_inbound_json=$(jq ".inbounds[$in_idx]" "$core_file") || return 1
+    [ "$clone_inbound_json" != "null" ] || return 1
+    safe_name=$(printf '%s' "$name" | tr -d ' ' | tr -cd 'a-zA-Z0-9-'); new_remark="${EMOJIS[$code]} $name"; in_tag=""
+    local attempts=0
+    while (( attempts < 1000 )); do
+        attempts=$((attempts+1)); rand_port=$(( RANDOM % 6000 + 3000)); in_tag="${code}-${safe_name}-IN-${rand_port}"; out_tag="${code}-${safe_name}-OUT-${out_port}"
+        if ! jq -e --arg t "$in_tag" --arg o "$out_tag" --argjson p "$rand_port" '.inbounds[]? | select((.tag // "")==$t or .port==$p)' "$core_file" >/dev/null 2>&1 && ! jq -e --arg o "$out_tag" '.outbounds[]? | select((.tag // "")==$o)' "$core_file" >/dev/null 2>&1; then break; fi
+    done
+    (( attempts < 1000 )) || return 1
+    jq --arg p "$rand_port" --arg t "$in_tag" --argjson obj "$clone_inbound_json" 'if .inbounds==null then .inbounds=[] else . end | .inbounds += [($obj|.port=($p|tonumber)|.tag=$t)]' "$core_file" > "$BASE_DIR/panel_sync.tmp" && mv -f "$BASE_DIR/panel_sync.tmp" "$core_file"
+    jq --arg t "$out_tag" --arg p "$out_port" 'if .outbounds==null then .outbounds=[] else . end | .outbounds += [{"tag":$t,"protocol":"socks","settings":{"servers":[{"address":"127.0.0.1","port":($p|tonumber)}]}}]' "$core_file" > "$BASE_DIR/panel_sync.tmp" && mv -f "$BASE_DIR/panel_sync.tmp" "$core_file"
+    jq --arg i "$in_tag" --arg o "$out_tag" 'if .routing==null then .routing={"rules":[]} elif .routing.rules==null then .routing.rules=[] else . end | .routing.rules += [{"type":"field","inboundTag":[$i],"outboundTag":$o}]' "$core_file" > "$BASE_DIR/panel_sync.tmp" && mv -f "$BASE_DIR/panel_sync.tmp" "$core_file"
+    if (( PANEL_HOST_INDEX > 0 )); then cloned_sni=$(jq -r ".[$((PANEL_HOST_INDEX-1))].address | if type==\"array\" and length>0 then .[0] elif type==\"string\" then . else \"\" end" "$hosts_file"); clone_host_json=$(jq ".[$((PANEL_HOST_INDEX-1))]" "$hosts_file"); fi
+    local original; original=$(curl -4 -sk --max-time 12 -X GET "$CORE_API_URL" -H "Authorization: Bearer $TOKEN" -H 'accept: application/json' 2>/dev/null || true)
+    local obj; obj=$(printf '%s' "$original" | jq -r 'if type=="object" and has("data") then .data else . end')
+    jq --slurpfile conf "$core_file" 'if .config!=null then .config=$conf[0] elif .xray_config!=null then .xray_config=$conf[0] elif .content!=null then .content=$conf[0] else .config=$conf[0] end' <<< "$obj" > "$BASE_DIR/panel_sync_payload.json"
+    local h; h=$(curl -4 -sk -o /dev/null -w '%{http_code}' --max-time 15 -X PUT "$CORE_API_URL?restart_nodes=true" -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' -d @"$BASE_DIR/panel_sync_payload.json" 2>/dev/null || echo 000)
+    [[ "$h" == 2* ]] || { echo -e "${RED}[!] Panel core sync failed: HTTP $h${NC}"; return 1; }
+    local host_json
+    if [ "$clone_host_json" != '{}' ] && [ "$clone_host_json" != 'null' ] && [ -n "$cloned_sni" ]; then host_json=$(jq --arg tag "$in_tag" --arg p "$rand_port" --arg rem "$new_remark" --argjson o "$clone_host_json" '$o|.inbound_tag=$tag|.port=($p|tonumber)|.remark=$rem|.enable=1|del(.id,.created_at,.updated_at)'); else host_json=$(jq -n --arg tag "$in_tag" --arg p "$rand_port" --arg rem "$new_remark" --arg addr "$cloned_sni" '{inbound_tag:$tag,remark:$rem,address:(if $addr=="" then [] else [$addr] end),port:($p|tonumber),enable:1}'); fi
+    h=$(curl -4 -sk -o /dev/null -w '%{http_code}' --max-time 12 -X POST "$URL/api/hosts" -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' -d "$host_json" 2>/dev/null || echo 000)
+    if [[ ! "$h" == 2* && "$h" != 409 ]]; then
+        local all; panel_load_hosts "$hosts_file" || true; jq --argjson n "$host_json" '. += [$n]' "$hosts_file" > "$BASE_DIR/panel_hosts_push.json"; curl -4 -sk -o /dev/null -w '%{http_code}' --max-time 12 -X PUT "$URL/api/hosts" -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' -d @"$BASE_DIR/panel_hosts_push.json" >/dev/null 2>&1 || true
+    fi
+    rm -f "$BASE_DIR/panel_sync_payload.json" "$BASE_DIR/panel_sync.tmp"
+    echo -e "${GREEN}[+] ${EMOJIS[$code]} $name synchronized to Panel.${NC}"
+    return 0
+}
+
 
 panel_batch_create() {
     source "$PANEL_CONF" 2>/dev/null || true
