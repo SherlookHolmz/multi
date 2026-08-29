@@ -1584,18 +1584,10 @@ deploy_node() {
                 fi
             fi
 
-            # NOTE (bugfix): do NOT unconditionally break here just because
-            # fallback_mode==1. Every branch above that actually needs to
-            # interrupt the attempt loop (rejected_ip_counts limit hit,
-            # Tor restart failure, the 5-wrong-IP primary-country skip
-            # action) already calls `break` itself at the point of decision.
-            # The old unconditional check below used to fire on the very
-            # FIRST rejected fallback IP -- before same_rejected_ip_limit or
-            # attempt_limit were ever reached -- which meant every fallback
-            # route effectively got only 1 attempt instead of its intended
-            # FALLBACK_ROUTE_ATTEMPTS (5), burning through all fallback
-            # countries almost instantly and reporting FAILED far sooner
-            # than it should. Removed.
+            if [ "$fallback_mode" -eq 1 ]; then
+                # Primary-country loop was interrupted by the 5-failure skip action.
+                break
+            fi
 
             if [ "$total_attempts" -lt "$attempt_limit" ]; then
                 last_ip="$public_ip"
@@ -1902,7 +1894,7 @@ ExecStart=$INSTALL_PATH --auto-heal-daemon
 Restart=always
 RestartSec=2
 User=root
-MemoryMax=2G
+MemoryMax=256M
 NoNewPrivileges=false
 
 [Install]
@@ -1992,14 +1984,6 @@ update_system() {
     if [ -f /etc/systemd/system/sherlook-heal.service ]; then
         sed -i "s#^ExecStart=.*#ExecStart=$INSTALL_PATH --auto-heal-daemon#" \
             /etc/systemd/system/sherlook-heal.service
-        # Bugfix: older installs pinned MemoryMax=256M on this unit. Every
-        # Tor process that auto-heal restarts (rotation, repair) becomes a
-        # child of THIS cgroup, and 256M is not enough once more than a
-        # handful of exit nodes are being rotated -- the kernel OOM-killer
-        # can take out the whole cgroup (all running Tor nodes at once,
-        # not just the one over budget) when the limit is hit. Raise it on
-        # every update so existing installs are corrected automatically.
-        sed -i "s#^MemoryMax=.*#MemoryMax=2G#" /etc/systemd/system/sherlook-heal.service
     fi
     systemctl daemon-reload
     systemctl enable --now sherlook-heal.service 2>/dev/null || true
@@ -2417,37 +2401,16 @@ panel_sync_single() {
 panel_batch_create() {
     source "$PANEL_CONF" 2>/dev/null || true
 
-    # BUGFIX: this used to require node_is_installed() -- conf file present
-    # AND a Tor process currently running AND a freshly-verified IP RIGHT
-    # NOW. That is the correct check for "should I redeploy this?" but it
-    # is the wrong check here: a node that is mid-rotation, briefly
-    # quarantined, or was knocked over by a transient issue is still a
-    # node you deployed and still want addable to the Panel -- it doesn't
-    # stop being "yours" just because it's between circuits for 10 seconds.
-    # Using that strict live-process check here meant a single bad
-    # auto-heal cycle (or just bad timing) could make EVERY deployed node
-    # invisible to the Panel screen at once, i.e. exactly the "No
-    # installed Tor nodes found" report even with nodes clearly deployed.
-    # node_has_record() only checks that the node was deployed (its conf
-    # file exists), which is what "installed" should mean for this list.
     local installed=()
-    local -A status_note=()
     for idx in "${ORDER[@]}"; do
         IFS=':' read -r code name out_port <<< "${NODES[$idx]}"
-        if node_has_record "$code" "$out_port"; then
+        if node_is_installed "$code" "$out_port"; then
             installed+=("$idx")
-            if node_is_installed "$code" "$out_port"; then
-                status_note[$idx]="${GREEN}online${NC}"
-            else
-                status_note[$idx]="${YELLOW}not currently online -- will still be added${NC}"
-            fi
         fi
     done
 
     if [ ${#installed[@]} -eq 0 ]; then
-        echo -e "\n${RED}[!] No deployed Tor nodes found (no node_*.conf files under $BASE_DIR).${NC}"
-        echo -e "${YELLOW}[!] Install nodes first with menu option [4] or [5].${NC}"
-        sleep 2; return
+        echo -e "\n${RED}[!] No installed Tor nodes found. Please install nodes first.${NC}"; sleep 2; return
     fi
 
     echo -e "\n📌 ${MAGENTA}[ INSTALLED NODES TO ADD ]${NC}"
@@ -2455,7 +2418,7 @@ panel_batch_create() {
     for idx in "${installed[@]}"; do
         IFS=':' read -r code name out_port <<< "${NODES[$idx]}"
         local emoji="${EMOJIS[$code]}"
-        printf "  ${CYAN}[%s]${NC} %s %-18s \tTorPort:${MAGENTA}%s${NC}  %b\n" "$idx" "$emoji" "$name" "$out_port" "${status_note[$idx]}"
+        printf "  ${CYAN}[%s]${NC} %s %-18s \tTorPort:${MAGENTA}%s${NC}\n" "$idx" "$emoji" "$name" "$out_port"
     done
     echo -e "${BLUE}──────────────────────────────────────────────────────────────────${NC}"
 
@@ -2497,7 +2460,7 @@ panel_batch_create() {
 
     echo -e "${CYAN}    > Searching for Cores...${NC}"
     for ep in "${core_endpoints[@]}"; do
-        local test_resp=$(curl -s --connect-timeout 10 --max-time 20 -X GET "$URL$ep/1" -H "Authorization: Bearer $TOKEN" -H "accept: application/json" | tr -d '\0')
+        local test_resp=$(curl -s -X GET "$URL$ep/1" -H "Authorization: Bearer $TOKEN" -H "accept: application/json" | tr -d '\0')
         local extracted=$(extract_json_from_response "$test_resp")
 
         if [ -n "$extracted" ]; then
@@ -2507,11 +2470,11 @@ panel_batch_create() {
             break
         fi
 
-        local list_resp=$(curl -s --connect-timeout 10 --max-time 20 -X GET "$URL$ep" -H "Authorization: Bearer $TOKEN" -H "accept: application/json" | tr -d '\0')
+        local list_resp=$(curl -s -X GET "$URL$ep" -H "Authorization: Bearer $TOKEN" -H "accept: application/json" | tr -d '\0')
         local core_ids=$(echo "$list_resp" | jq -r '.[].id // .data[].id // empty' 2>/dev/null | head -n 1)
 
         if [ -n "$core_ids" ]; then
-            local fetch_resp=$(curl -s --connect-timeout 10 --max-time 20 -X GET "$URL$ep/$core_ids" -H "Authorization: Bearer $TOKEN" -H "accept: application/json" | tr -d '\0')
+            local fetch_resp=$(curl -s -X GET "$URL$ep/$core_ids" -H "Authorization: Bearer $TOKEN" -H "accept: application/json" | tr -d '\0')
             local extracted2=$(extract_json_from_response "$fetch_resp")
             if [ -n "$extracted2" ]; then
                 echo "$extracted2" > "$CORE_FILE"
@@ -2523,10 +2486,10 @@ panel_batch_create() {
     done
 
     if [ $found_config -eq 0 ]; then
-        local nodes_resp=$(curl -s --connect-timeout 10 --max-time 20 -X GET "$URL/api/nodes" -H "Authorization: Bearer $TOKEN" -H "accept: application/json" | tr -d '\0')
+        local nodes_resp=$(curl -s -X GET "$URL/api/nodes" -H "Authorization: Bearer $TOKEN" -H "accept: application/json" | tr -d '\0')
         local node_ids=$(echo "$nodes_resp" | jq -r '.[].id // .data[].id // empty' 2>/dev/null)
         for nid in $node_ids; do
-            local n_resp=$(curl -s --connect-timeout 10 --max-time 20 -X GET "$URL/api/node/$nid" -H "Authorization: Bearer $TOKEN" -H "accept: application/json" | tr -d '\0')
+            local n_resp=$(curl -s -X GET "$URL/api/node/$nid" -H "Authorization: Bearer $TOKEN" -H "accept: application/json" | tr -d '\0')
             local extracted3=$(extract_json_from_response "$n_resp")
             if [ -n "$extracted3" ]; then
                 echo "$extracted3" > "$CORE_FILE"
@@ -2580,7 +2543,7 @@ panel_batch_create() {
     local clone_host_json="{}"
     local HOSTS_FILE="$BASE_DIR/panel_hosts.json"
 
-    local hosts_resp=$(curl -s --connect-timeout 10 --max-time 20 -X GET "$URL/api/hosts" -H "Authorization: Bearer $TOKEN" -H "accept: application/json" | tr -d '\0')
+    local hosts_resp=$(curl -s -X GET "$URL/api/hosts" -H "Authorization: Bearer $TOKEN" -H "accept: application/json" | tr -d '\0')
     local is_array=$(echo "$hosts_resp" | jq -r 'type == "array"' 2>/dev/null)
 
     if [ "$is_array" == "true" ]; then
@@ -2656,37 +2619,6 @@ panel_batch_create() {
     cp "$CORE_FILE" "$FINAL_FILE"
     echo "[]" > "$NEW_HOSTS_FILE"
 
-    # PERFORMANCE FIX: the old version re-parsed and re-wrote the ENTIRE
-    # $FINAL_FILE (a full clone of the panel's live Xray config -- which
-    # only grows over time as more nodes get added across every past run)
-    # THREE separate times per selected node, using a brand-new jq process
-    # each time. For a big batch ("all" countries) against a config that
-    # has accumulated a lot of history, that is O(N) full-file rewrites of
-    # an ever-larger file -- it does not hang forever, but it can go from
-    # "instant" to "many minutes with zero visible progress" as the config
-    # grows, which looks exactly like a freeze at "Generating Inbounds...".
-    # Fix: accumulate the new inbounds/outbounds/routing rules in small
-    # side files (cheap to rewrite every iteration since they only ever
-    # contain what THIS run is adding) and merge them into $FINAL_FILE
-    # with exactly one jq pass each, after the loop.
-    local NEW_INBOUNDS_FILE="$BASE_DIR/new_inbounds.json"
-    local NEW_OUTBOUNDS_FILE="$BASE_DIR/new_outbounds.json"
-    local NEW_ROUTES_FILE="$BASE_DIR/new_routes.json"
-    echo "[]" > "$NEW_INBOUNDS_FILE"
-    echo "[]" > "$NEW_OUTBOUNDS_FILE"
-    echo "[]" > "$NEW_ROUTES_FILE"
-
-    # Seed the used-port/tag tracking ONCE from the original config instead
-    # of re-querying the (growing) file on every single node.
-    local -A used_ports=() used_intags=() used_outtags=()
-    local _v
-    while IFS= read -r _v; do [ -n "$_v" ] && used_ports["$_v"]=1; done \
-        < <(jq -r '.inbounds[]?.port // empty' "$FINAL_FILE" 2>/dev/null)
-    while IFS= read -r _v; do [ -n "$_v" ] && used_intags["$_v"]=1; done \
-        < <(jq -r '.inbounds[]?.tag // empty' "$FINAL_FILE" 2>/dev/null)
-    while IFS= read -r _v; do [ -n "$_v" ] && used_outtags["$_v"]=1; done \
-        < <(jq -r '.outbounds[]?.tag // empty' "$FINAL_FILE" 2>/dev/null)
-
     for idx in "${selected_nodes[@]}"; do
         IFS=':' read -r code name out_port <<< "${NODES[$idx]}"
         local emoji="${EMOJIS[$code]}"
@@ -2709,25 +2641,26 @@ panel_batch_create() {
             in_tag="${code}-${safe_name}-IN-${rand_port}"
             out_tag="${code}-${safe_name}-OUT-${out_port}"
 
-            if [[ -z "${used_ports[$rand_port]:-}" && -z "${used_intags[$in_tag]:-}" && -z "${used_outtags[$out_tag]:-}" ]]; then
+            local port_exists=$(jq -e ".inbounds[]? | select(.port == $rand_port)" "$FINAL_FILE" >/dev/null 2>&1 && echo "yes" || echo "no")
+            local in_tag_exists=$(jq -e ".inbounds[]? | select(.tag == \"$in_tag\")" "$FINAL_FILE" >/dev/null 2>&1 && echo "yes" || echo "no")
+            local out_tag_exists=$(jq -e ".outbounds[]? | select(.tag == \"$out_tag\")" "$FINAL_FILE" >/dev/null 2>&1 && echo "yes" || echo "no")
+
+            if [[ "$port_exists" == "no" && "$in_tag_exists" == "no" && "$out_tag_exists" == "no" ]]; then
                 break
             fi
         done
-        used_ports["$rand_port"]=1
-        used_intags["$in_tag"]=1
-        used_outtags["$out_tag"]=1
 
         jq --arg p "$rand_port" --arg t "$in_tag" --argjson obj "$clone_inbound_json" \
-           '. += [($obj | .port=($p|tonumber) | .tag=$t)]' \
-           "$NEW_INBOUNDS_FILE" > "$BASE_DIR/tmp_ib.json" && mv -f "$BASE_DIR/tmp_ib.json" "$NEW_INBOUNDS_FILE"
+           'if .inbounds == null then .inbounds = [] else . end | .inbounds += [($obj | .port=($p|tonumber) | .tag=$t)]' \
+           "$FINAL_FILE" > "$BASE_DIR/tmp.json" && mv -f "$BASE_DIR/tmp.json" "$FINAL_FILE"
 
         jq --arg t "$out_tag" --arg p "$out_port" \
-           '. += [{"tag": $t, "protocol": "socks", "settings": {"servers": [{"address": "127.0.0.1", "port": ($p|tonumber)}]}}]' \
-           "$NEW_OUTBOUNDS_FILE" > "$BASE_DIR/tmp_ob.json" && mv -f "$BASE_DIR/tmp_ob.json" "$NEW_OUTBOUNDS_FILE"
+           'if has("outbounds") and .outbounds != null then . else .outbounds = [] end | .outbounds += [{"tag": $t, "protocol": "socks", "settings": {"servers": [{"address": "127.0.0.1", "port": ($p|tonumber)}]}}]' \
+           "$FINAL_FILE" > "$BASE_DIR/tmp.json" && mv -f "$BASE_DIR/tmp.json" "$FINAL_FILE"
 
         jq --arg intag "$in_tag" --arg outtag "$out_tag" \
-           '. += [{"type": "field", "inboundTag": [$intag], "outboundTag": $outtag}]' \
-           "$NEW_ROUTES_FILE" > "$BASE_DIR/tmp_rt.json" && mv -f "$BASE_DIR/tmp_rt.json" "$NEW_ROUTES_FILE"
+           'if has("routing") and .routing != null then . else .routing = {"rules": []} end | if .routing.rules == null then .routing.rules = [] else . end | .routing.rules += [{"type": "field", "inboundTag": [$intag], "outboundTag": $outtag}]' \
+           "$FINAL_FILE" > "$BASE_DIR/tmp.json" && mv -f "$BASE_DIR/tmp.json" "$FINAL_FILE"
 
         if [ "$clone_host_json" != "{}" ] && [ "$clone_host_json" != "null" ]; then
             jq --arg tag "$in_tag" --arg p "$rand_port" --arg rem "$new_remark" --argjson obj "$clone_host_json" \
@@ -2742,23 +2675,11 @@ panel_batch_create() {
         echo -e "  ⚙️  $emoji $name | In:$rand_port ➔ Out:$out_port Prepared."
     done
 
-    echo -e "  ${CYAN}> Merging generated inbounds/outbounds/routing into the core config...${NC}"
-    jq --slurpfile ib "$NEW_INBOUNDS_FILE" \
-       'if .inbounds == null then .inbounds = [] else . end | .inbounds += $ib[0]' \
-       "$FINAL_FILE" > "$BASE_DIR/tmp.json" && mv -f "$BASE_DIR/tmp.json" "$FINAL_FILE"
-    jq --slurpfile ob "$NEW_OUTBOUNDS_FILE" \
-       'if has("outbounds") and .outbounds != null then . else .outbounds = [] end | .outbounds += $ob[0]' \
-       "$FINAL_FILE" > "$BASE_DIR/tmp.json" && mv -f "$BASE_DIR/tmp.json" "$FINAL_FILE"
-    jq --slurpfile rt "$NEW_ROUTES_FILE" \
-       'if has("routing") and .routing != null then . else .routing = {"rules": []} end | if .routing.rules == null then .routing.rules = [] else . end | .routing.rules += $rt[0]' \
-       "$FINAL_FILE" > "$BASE_DIR/tmp.json" && mv -f "$BASE_DIR/tmp.json" "$FINAL_FILE"
-    rm -f "$NEW_INBOUNDS_FILE" "$NEW_OUTBOUNDS_FILE" "$NEW_ROUTES_FILE"
-
     echo -e "\n🚀 ${MAGENTA}[ UPLOADING DIRECTLY TO PANEL VIA API ]${NC}"
     echo -e "${BLUE}────────────────────────────────────────────────────────────${NC}"
 
     if [ -n "$CORE_API_URL" ]; then
-        local original_core_resp=$(curl -s --connect-timeout 10 --max-time 20 -X GET "$CORE_API_URL" -H "Authorization: Bearer $TOKEN" -H "accept: application/json" | tr -d '\0')
+        local original_core_resp=$(curl -s -X GET "$CORE_API_URL" -H "Authorization: Bearer $TOKEN" -H "accept: application/json" | tr -d '\0')
         local core_obj=$(echo "$original_core_resp" | jq -r 'if type == "object" and has("data") then .data else . end')
         if [ -z "$core_obj" ] || [ "$core_obj" == "null" ]; then core_obj="{}"; fi
 
@@ -2811,7 +2732,7 @@ panel_batch_create() {
         done
 
         if [ $h_success -eq 0 ] && [[ "$h_code" == "405" || "$h_code" == "404" ]]; then
-            local current_hosts=$(curl -s --connect-timeout 10 --max-time 20 -X GET "$URL/api/hosts" -H "Authorization: Bearer $TOKEN" -H "accept: application/json" | tr -d '\0')
+            local current_hosts=$(curl -s -X GET "$URL/api/hosts" -H "Authorization: Bearer $TOKEN" -H "accept: application/json" | tr -d '\0')
             local is_arr=$(echo "$current_hosts" | jq 'type == "array"' 2>/dev/null)
 
             if [ "$is_arr" == "true" ]; then
@@ -2855,40 +2776,6 @@ if [ "${1:-}" = "--install" ]; then
 fi
 
 # ================= MENU LOOP =================
-toggle_auto_heal() {
-    check_root
-    draw_header
-    echo -e "📌 ${MAGENTA}[ AUTO-HEAL SERVICE ]${NC}\n"
-    if systemctl is-active --quiet sherlook-heal.service 2>/dev/null; then
-        echo -e "${GREEN}Auto-Heal is currently ACTIVE.${NC}"
-        echo -e "${YELLOW}[!] While active, it will stop/restart any node it judges unhealthy${NC}"
-        echo -e "${YELLOW}    (dead process, SOCKS unreachable, or wrong-country IP).${NC}\n"
-        echo -e "  ${CYAN}[1]${NC} Stop it for this boot only (systemctl stop)"
-        echo -e "  ${CYAN}[2]${NC} Stop it AND disable it permanently (survives reboot)"
-        echo -e "  ${RED}[0]${NC} Leave it running / go back"
-        read -r -p "Choice [0-2]: " ah_choice < /dev/tty || return
-        case "$ah_choice" in
-            1) systemctl stop sherlook-heal.service; echo -e "${GREEN}[+] Stopped. It will come back on the next reboot.${NC}" ;;
-            2) systemctl disable --now sherlook-heal.service; echo -e "${GREEN}[+] Stopped and disabled. It will NOT come back automatically.${NC}" ;;
-            *) echo -e "${CYAN}[*] No change.${NC}" ;;
-        esac
-    else
-        echo -e "${YELLOW}Auto-Heal is currently INACTIVE.${NC}"
-        echo -e "${CYAN}[!] Nodes that die or drift off-country will NOT be repaired automatically${NC}"
-        echo -e "${CYAN}    while it's off -- use option [8] to rotate them by hand instead.${NC}\n"
-        echo -e "  ${CYAN}[1]${NC} Start it now and enable it (recommended)"
-        echo -e "  ${CYAN}[2]${NC} Start it for this boot only (won't survive reboot)"
-        echo -e "  ${RED}[0]${NC} Leave it off / go back"
-        read -r -p "Choice [0-2]: " ah_choice < /dev/tty || return
-        case "$ah_choice" in
-            1) systemctl enable --now sherlook-heal.service; echo -e "${GREEN}[+] Started and enabled.${NC}" ;;
-            2) systemctl start sherlook-heal.service; echo -e "${GREEN}[+] Started for this boot only.${NC}" ;;
-            *) echo -e "${CYAN}[*] No change.${NC}" ;;
-        esac
-    fi
-    sleep 2
-}
-
 while true; do
     draw_header
     if command -v tor &> /dev/null && command -v jq &> /dev/null; then
@@ -2910,19 +2797,18 @@ while true; do
     echo -e "  ${GREEN}[6]${NC} ${WHITE}»${NC} View Active Nodes"
     echo -e "  ${GREEN}[7]${NC} ${WHITE}»${NC} Edit or Delete Nodes"
     echo -e "  ${CYAN}[8]${NC} ${WHITE}»${NC} 🔄 Change IP / IP Rotation"
-    echo -e "  ${CYAN}[A]${NC} ${WHITE}»${NC} Toggle Auto-Heal Service (on/off)"
     echo -e "${BLUE} ────────────────────────────────────────────────────────${NC}"
     echo -e "  ${YELLOW}[9]${NC} ${WHITE}»${NC} Panel Nexatis Integration"
     echo -e "${BLUE} ────────────────────────────────────────────────────────${NC}"
     echo -e "  ${RED}[0]${NC} ${WHITE}»${NC} Exit Program"
     echo -e "${BLUE} ────────────────────────────────────────────────────────${NC}\n"
 
-    if ! read -r -p "$(echo -e ${MAGENTA}"Enter choice [0-9/A]: "${NC})" main_choice < /dev/tty; then
+    if ! read -r -p "$(echo -e ${MAGENTA}"Enter choice [0-9]: "${NC})" main_choice < /dev/tty; then
         echo -e "\n${RED}[!] No terminal input available (are you piping this, e.g. curl | bash?). Exiting.${NC}"
         exit 1
     fi
 
-    case "${main_choice,,}" in
+    case $main_choice in
         1) install_engine ;;
         2) update_system ;;
         8) change_ip_menu ;;
@@ -2931,7 +2817,6 @@ while true; do
         5) bulk_add_nodes ;;
         6) view_active_nodes ;;
         7) edit_delete_nodes ;;
-        a) toggle_auto_heal ;;
         9) check_root; panel_login ;;
         0) clear; exit 0 ;;
         *) ;;
