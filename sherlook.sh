@@ -1584,10 +1584,18 @@ deploy_node() {
                 fi
             fi
 
-            if [ "$fallback_mode" -eq 1 ]; then
-                # Primary-country loop was interrupted by the 5-failure skip action.
-                break
-            fi
+            # NOTE (bugfix): do NOT unconditionally break here just because
+            # fallback_mode==1. Every branch above that actually needs to
+            # interrupt the attempt loop (rejected_ip_counts limit hit,
+            # Tor restart failure, the 5-wrong-IP primary-country skip
+            # action) already calls `break` itself at the point of decision.
+            # The old unconditional check below used to fire on the very
+            # FIRST rejected fallback IP -- before same_rejected_ip_limit or
+            # attempt_limit were ever reached -- which meant every fallback
+            # route effectively got only 1 attempt instead of its intended
+            # FALLBACK_ROUTE_ATTEMPTS (5), burning through all fallback
+            # countries almost instantly and reporting FAILED far sooner
+            # than it should. Removed.
 
             if [ "$total_attempts" -lt "$attempt_limit" ]; then
                 last_ip="$public_ip"
@@ -1894,7 +1902,7 @@ ExecStart=$INSTALL_PATH --auto-heal-daemon
 Restart=always
 RestartSec=2
 User=root
-MemoryMax=256M
+MemoryMax=2G
 NoNewPrivileges=false
 
 [Install]
@@ -1984,6 +1992,14 @@ update_system() {
     if [ -f /etc/systemd/system/sherlook-heal.service ]; then
         sed -i "s#^ExecStart=.*#ExecStart=$INSTALL_PATH --auto-heal-daemon#" \
             /etc/systemd/system/sherlook-heal.service
+        # Bugfix: older installs pinned MemoryMax=256M on this unit. Every
+        # Tor process that auto-heal restarts (rotation, repair) becomes a
+        # child of THIS cgroup, and 256M is not enough once more than a
+        # handful of exit nodes are being rotated -- the kernel OOM-killer
+        # can take out the whole cgroup (all running Tor nodes at once,
+        # not just the one over budget) when the limit is hit. Raise it on
+        # every update so existing installs are corrected automatically.
+        sed -i "s#^MemoryMax=.*#MemoryMax=2G#" /etc/systemd/system/sherlook-heal.service
     fi
     systemctl daemon-reload
     systemctl enable --now sherlook-heal.service 2>/dev/null || true
