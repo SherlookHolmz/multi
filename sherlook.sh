@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Sherlook Automate Engine v6.5.0 (Nexatis API Edition)
-# Bugfix release: lower CPU auto-heal, fixed panel-delete data loss, pending-cleanup queue, refreshed UI
+# Sherlook Automate Engine v6.4.1 (Nexatis API Edition)
+# Bugfix release: stable Tor routing, IP rotation, live status, bulk selection and in-place updates
 
 # ================= COLORS =================
 RED='\033[1;31m'
@@ -22,21 +22,13 @@ RAW_ENGINE_URL="$RAW_BASE/sherlook.sh"
 RAW_INSTALLER_URL="$RAW_BASE/install.sh"
 # Installer resolves this placeholder to the exact commit installed.
 PINNED_COMMIT="__INSTALLER_RESOLVES__"
-SHERLOOK_VERSION="6.5.0"
+SHERLOOK_VERSION="6.4.1"
 LOCATION_CACHE="$DATA_DIR/onionoo_exit_countries.cache"
 LOCATION_CATALOG="$DATA_DIR/location_catalog.tsv"
 LOCATION_CACHE_TTL=21600
-# CPU/network tuning (v6.5.0): the old defaults (interval=5s, full 3-source
-# GeoIP re-verification of every node, every cycle) meant the daemon was
-# almost never idle and kept forking curl/jq/bash processes back-to-back.
-# AUTO_HEAL_INTERVAL: seconds between auto-heal passes.
-AUTO_HEAL_INTERVAL=30
-# How many auto-heal passes between full GeoIP re-verification passes for
-# nodes that are already ONLINE and healthy. In between, only a cheap
-# liveness check (process alive + SOCKS reachable) runs for those nodes.
-HEALTH_FULL_RECHECK_EVERY=6
-AUTO_HEAL_PARALLEL=10
-EFFECTIVE_PARALLEL=10
+AUTO_HEAL_INTERVAL=5
+AUTO_HEAL_PARALLEL=16
+EFFECTIVE_PARALLEL=16
 BRIDGE_MODE=0
 BRIDGE_PARALLEL=2
 BRIDGE_FILE="$BASE_DIR/bridges.conf"
@@ -325,10 +317,7 @@ fallback_or_retry_deploy() {
 validate_node_ip() {
     local ip="$1" expected="$2" visual="${3:-0}"
     local result bad actual reason seen
-    # Full 3-source cross-check (fast=0): this runs during interactive
-    # deploy/rotate, not on every auto-heal tick, so the extra accuracy is
-    # worth the two extra API calls here.
-    result=$(check_ip_quality "$ip" "$expected" "$visual" 0)
+    result=$(check_ip_quality "$ip" "$expected" "$visual")
     IFS='|' read -r bad actual reason seen <<< "$result"
     printf '%s|%s|%s|%s\n' "$bad" "$actual" "$reason" "$seen"
 }
@@ -644,65 +633,27 @@ check_ip_quality() {
     local ip="$1"
     local expected_cc="${2^^}"
     local visual="${3:-0}"
-    # fast=1 (default for routine auto-heal passes): ask only the first GeoIP
-    # source and stop there if it already agrees with the expected country.
-    # This is the common case (a healthy node matches on the first source),
-    # so it avoids firing two extra curl processes + API calls per node on
-    # every single auto-heal cycle. Full 3-source cross-checking still runs
-    # whenever the quick source disagrees/is unavailable, or when the caller
-    # explicitly asks for it (fast=0) -- e.g. right after deploying a node.
-    local fast="${4:-1}"
     local tmpdir
     tmpdir=$(mktemp -d /tmp/sherlook_geo.XXXXXX) || { echo "1||GEOIP_UNAVAILABLE|"; return; }
 
     curl -4 -sS --connect-timeout 3 --max-time 6 "https://api.ipapi.is/?q=$ip" >"$tmpdir/a" 2>/dev/null & local p1=$!
-    local p2="" p3=""
-    if [ "$fast" != "1" ]; then
-        curl -4 -sS --connect-timeout 3 --max-time 6 "https://ipwho.is/$ip" >"$tmpdir/b" 2>/dev/null & p2=$!
-        curl -4 -sS --connect-timeout 3 --max-time 6 "https://ipapi.co/$ip/json/" >"$tmpdir/c" 2>/dev/null & p3=$!
-    fi
+    curl -4 -sS --connect-timeout 3 --max-time 6 "https://ipwho.is/$ip" >"$tmpdir/b" 2>/dev/null & local p2=$!
+    curl -4 -sS --connect-timeout 3 --max-time 6 "https://ipapi.co/$ip/json/" >"$tmpdir/c" 2>/dev/null & local p3=$!
     if [ "$visual" = "1" ]; then
-        while kill -0 "$p1" 2>/dev/null || { [ -n "$p2" ] && kill -0 "$p2" 2>/dev/null; } || { [ -n "$p3" ] && kill -0 "$p3" 2>/dev/null; }; do
-            ui_spin_frame "Verifying country / IP ${ip}"
+        while kill -0 "$p1" 2>/dev/null || kill -0 "$p2" 2>/dev/null || kill -0 "$p3" 2>/dev/null; do
+            ui_spin_frame "Verifying country / IP ${ip} (3 GeoIP sources)"
             sleep 0.12
         done
     fi
-    wait "$p1" 2>/dev/null || true
-    [ -n "$p2" ] && wait "$p2" 2>/dev/null
-    [ -n "$p3" ] && wait "$p3" 2>/dev/null
+    wait "$p1" "$p2" "$p3" 2>/dev/null || true
     [ "$visual" = "1" ] && printf '\r\033[K' >&2
 
-    local api1 cc1
+    local api1 api2 api3 cc1 cc2 cc3
     api1=$(cat "$tmpdir/a" 2>/dev/null || true)
-    cc1=$(printf '%s' "$api1" | jq -r '.location.country_code // .country_code // empty' 2>/dev/null | tr '[:lower:]' '[:upper:]')
-
-    if [ "$fast" = "1" ] && [ "$cc1" = "$expected_cc" ]; then
-        # Quick source already confirms the expected exit country -- treat
-        # like a single-source pass without paying for two more API calls.
-        local risk_level_fast
-        risk_level_fast=$(jq -r '.abuser_score // .abuse_score // empty' "$tmpdir/a" 2>/dev/null || true)
-        rm -rf "$tmpdir"
-        if [[ "$risk_level_fast" =~ (High|VERY_HIGH|Very.High) ]]; then
-            echo "1|${cc1}|HIGH_RISK|${cc1}"
-        else
-            echo "0|${cc1}|GEOIP_SINGLE_SOURCE|${cc1}"
-        fi
-        return
-    fi
-
-    # Either the fast path wasn't used, or the quick source didn't confirm
-    # the expected country -- escalate to the full 3-source cross-check so
-    # we never *weaken* accuracy, only skip redundant calls on the easy path.
-    if [ "$fast" = "1" ]; then
-        curl -4 -sS --connect-timeout 3 --max-time 6 "https://ipwho.is/$ip" >"$tmpdir/b" 2>/dev/null & p2=$!
-        curl -4 -sS --connect-timeout 3 --max-time 6 "https://ipapi.co/$ip/json/" >"$tmpdir/c" 2>/dev/null & p3=$!
-        wait "$p2" "$p3" 2>/dev/null || true
-    fi
-
-    local api2 api3 cc2 cc3
     api2=$(cat "$tmpdir/b" 2>/dev/null || true)
     api3=$(cat "$tmpdir/c" 2>/dev/null || true)
 
+    cc1=$(printf '%s' "$api1" | jq -r '.location.country_code // .country_code // empty' 2>/dev/null | tr '[:lower:]' '[:upper:]')
     cc2=$(printf '%s' "$api2" | jq -r '.country_code // .countryCode // empty' 2>/dev/null | tr '[:lower:]' '[:upper:]')
     cc3=$(printf '%s' "$api3" | jq -r '.country_code // empty' 2>/dev/null | tr '[:lower:]' '[:upper:]')
 
@@ -795,11 +746,6 @@ EOF
 
 health_check_node() {
     local code="$1" name="$2" out_port="$3" silent="${4:-1}" repair="${5:-1}"
-    # full=1: run the full 3-source GeoIP cross-check (used every
-    # HEALTH_FULL_RECHECK_EVERY cycles). full=0 (default): use the fast
-    # 1-source-with-escalation path in check_ip_quality -- cheap on CPU/
-    # network for the common case where the node is already healthy.
-    local full="${6:-0}"
     local conf_file="$BASE_DIR/node_${code}_${out_port}.conf" inst_data_dir="$DATA_DIR/${code}_${out_port}" ip_file="$DATA_DIR/${code}_${out_port}/last_ip.txt"
     [ -f "$conf_file" ] || return 0
     if node_quarantine_active "$code" "$out_port"; then return 4; fi
@@ -825,8 +771,7 @@ health_check_node() {
         return 1
     fi
     expected_route=$(node_route_code "$code" "$out_port")
-    local geo_fast=1; [ "$full" = "1" ] && geo_fast=0
-    result=$(check_ip_quality "$current_ip" "$expected_route" 0 "$geo_fast"); IFS='|' read -r bad actual reason seen <<< "$result"
+    result=$(check_ip_quality "$current_ip" "$expected_route"); IFS='|' read -r bad actual reason seen <<< "$result"
     # A live public IP is useful even when an external GeoIP provider is
     # temporarily unavailable. Keep the IP visible and mark the node as
     # ONLINE_UNVERIFIED instead of pretending that it is fully verified.
@@ -858,10 +803,6 @@ health_check_node() {
 }
 
 background_auto_heal() {
-    # full=1 forces the full 3-source GeoIP cross-check for every node this
-    # pass (used every HEALTH_FULL_RECHECK_EVERY cycles by the daemon, and
-    # for one-off manual runs via --auto-heal).
-    local full="${1:-1}"
     check_root
     sync_dynamic_locations
     compute_effective_parallel
@@ -871,7 +812,7 @@ background_auto_heal() {
     for idx in "${ORDER[@]}"; do
         details="${NODES[$idx]}"; IFS=':' read -r code name out_port <<< "$details"
         [ -f "$BASE_DIR/node_${code}_${out_port}.conf" ] || continue
-        health_check_node "$code" "$name" "$out_port" 1 1 "$full" & pids+=("$!"); running=$((running+1))
+        health_check_node "$code" "$name" "$out_port" 1 1 & pids+=("$!"); running=$((running+1))
         if (( running >= EFFECTIVE_PARALLEL )); then
             wait "${pids[0]}" 2>/dev/null || true; pids=("${pids[@]:1}"); running=$((running-1))
         fi
@@ -882,24 +823,9 @@ background_auto_heal() {
 auto_heal_daemon() {
     check_root
     trap 'exit 0' INT TERM HUP
-    local cycle=0 pass_start pass_end elapsed sleep_for full
     while true; do
-        cycle=$((cycle+1))
-        full=0
-        # First pass after startup, and then every HEALTH_FULL_RECHECK_EVERY
-        # cycles, do the thorough 3-source recheck; the rest are cheap.
-        if (( cycle == 1 || cycle % HEALTH_FULL_RECHECK_EVERY == 0 )); then full=1; fi
-        pass_start=$(date +%s)
-        background_auto_heal "$full" || true
-        pass_end=$(date +%s)
-        elapsed=$(( pass_end - pass_start ))
-        sleep_for=$(( AUTO_HEAL_INTERVAL - elapsed ))
-        # If a pass already took longer than the interval (large node count,
-        # slow network), don't stack the next pass right on top of it --
-        # still give the CPU a short breather instead of hammering in a
-        # tight loop.
-        (( sleep_for < 3 )) && sleep_for=3
-        sleep "$sleep_for"
+        background_auto_heal || true
+        sleep "$AUTO_HEAL_INTERVAL"
     done
 }
 
@@ -918,7 +844,7 @@ if [ "${1:-}" = "--auto-heal-daemon" ]; then
 fi
 
 
-# ================= V6.5.0 HEALTH / BRIDGE / PANEL SAFETY =================
+# ================= V6.4.1 HEALTH / BRIDGE / PANEL SAFETY =================
 
 node_dir() { printf '%s\n' "$DATA_DIR/${1}_${2}"; }
 node_index_by_code() {
@@ -1178,24 +1104,10 @@ panel_prepare_templates() {
     echo -e "${GREEN}[+] Panel templates saved securely (chmod 600, password not stored).${NC}"
 }
 
-# Removes the given node IDs from the panel (Core inbounds/outbounds/routing
-# + hosts). Every failure path now prints WHY it failed, and the return code
-# tells the caller exactly what state the panel ended up in, so callers can
-# decide whether it is safe to also wipe the local node record:
-#   0 = fully removed from panel (core + hosts confirmed)
-#   1 = nothing was removed from panel (safe to retry later, local record
-#       should be left alone)
-#   2 = partially removed (core config updated, but the hosts/SNI entries
-#       could not be confirmed removed) -- needs a manual/second look
 panel_delete_node_ids() {
-    panel_auth_preflight
-    local auth_rc=$?
-    if [ "$auth_rc" != "0" ]; then
-        [ "$auth_rc" = "2" ] || echo -e "${RED}[!] Not logged in to the Panel (or Panel unreachable). Login from option 9 first.${NC}"
-        return 1
-    fi
+    panel_auth_preflight || return $?
     local core_file="$BASE_DIR/remote_core.json" hosts_file="$BASE_DIR/panel_hosts.json"
-    panel_core_fetch "$core_file" || { echo -e "${RED}[!] Could not locate the Panel's Core API -- nothing was removed from the Panel.${NC}"; return 1; }
+    panel_core_fetch "$core_file" || return 1
     panel_load_hosts "$hosts_file"
     local tmp="$BASE_DIR/panel_core_delete.tmp.json" idx code name out_port safe in_prefix out_tag
     local pattern_file="$BASE_DIR/panel_delete_patterns.txt"; : > "$pattern_file"
@@ -1204,99 +1116,21 @@ panel_delete_node_ids() {
       def hit($tag): any($patterns[0][]; . as $p | ((($tag // "") | startswith($p[0] + "-" + $p[1] + "-IN-")) or (($tag // "") == ($p[0] + "-" + $p[1] + "-OUT-" + $p[2]))));
       .inbounds = [(.inbounds // [])[] | select(hit(.tag)|not)] |
       .outbounds = [(.outbounds // [])[] | select(hit(.tag)|not)] |
-      .routing.rules = [(.routing.rules // [])[] | select((((.inboundTag // []) | map(hit(.)) | any) or hit(.outboundTag // "")) | not)]
-    ' "$core_file" > "$tmp" 2>/dev/null || { echo -e "${RED}[!] Failed to build the updated Panel config (jq error) -- nothing was removed from the Panel.${NC}"; return 1; }
+      .routing.rules = [(.routing.rules // [])[] | select((hit(.outboundTag // "")) and false or (((.inboundTag // []) | map(hit(.)) | any) or hit(.outboundTag // "")) | not)]
+    ' "$core_file" > "$tmp" 2>/dev/null || return 1
     mv -f "$tmp" "$core_file"
     local original; original=$(curl -4 -sk --max-time 10 -X GET "$CORE_API_URL" -H "Authorization: Bearer $TOKEN" -H 'accept: application/json' 2>/dev/null || true)
     local obj; obj=$(printf '%s' "$original" | jq -r 'if type=="object" and has("data") then .data else . end')
     jq --slurpfile conf "$core_file" 'if .config!=null then .config=$conf[0] elif .xray_config!=null then .xray_config=$conf[0] elif .content!=null then .content=$conf[0] else .config=$conf[0] end' <<< "$obj" > "$BASE_DIR/panel_delete_payload.json"
     local code_http; code_http=$(curl -4 -sk -o /dev/null -w '%{http_code}' -X PUT "$CORE_API_URL" -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' -d @"$BASE_DIR/panel_delete_payload.json" 2>/dev/null || echo 000)
-    if [[ "$code_http" != 2* ]]; then
-        echo -e "${RED}[!] Panel core delete failed (HTTP $code_http) -- nothing was removed from the Panel.${NC}"
-        return 1
-    fi
-    local host_rc=0
+    [[ "$code_http" == 2* ]] || { echo -e "${RED}[!] Panel core delete failed (HTTP $code_http).${NC}"; return 1; }
     if [ -s "$hosts_file" ]; then
-        if jq --slurpfile patterns <(jq -R 'split("|")' "$pattern_file" | jq -s '.') '[.[] | select(((.inbound_tag // "") as $t | any($patterns[0][]; . as $p | ($t | startswith($p[0] + "-" + $p[1] + "-IN-")))) | not)]' "$hosts_file" > "$BASE_DIR/panel_hosts_filtered.json"; then
-            code_http=$(curl -4 -sk -o /dev/null -w '%{http_code}' -X PUT "$URL/api/hosts" -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' -d @"$BASE_DIR/panel_hosts_filtered.json" 2>/dev/null || echo 000)
-            if [[ "$code_http" != 2* ]]; then
-                echo -e "${YELLOW}[!] Panel core entry was removed, but the Host/SNI entries could not be confirmed removed (HTTP $code_http). Check the Panel's Hosts list manually.${NC}"
-                host_rc=2
-            fi
-        else
-            echo -e "${YELLOW}[!] Panel core entry was removed, but building the Hosts update failed (jq error). Check the Panel's Hosts list manually.${NC}"
-            host_rc=2
-        fi
+        jq --slurpfile patterns <(jq -R 'split("|")' "$pattern_file" | jq -s '.') '[.[] | select(((.inbound_tag // "") as $t | any($patterns[0][]; . as $p | ($t | startswith($p[0] + "-" + $p[1] + "-IN-")))) | not)]' "$hosts_file" > "$BASE_DIR/panel_hosts_filtered.json" || return 1
+        code_http=$(curl -4 -sk -o /dev/null -w '%{http_code}' -X PUT "$URL/api/hosts" -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' -d @"$BASE_DIR/panel_hosts_filtered.json" 2>/dev/null || echo 000)
+        [[ "$code_http" == 2* ]] || echo -e "${YELLOW}[!] Host delete returned HTTP $code_http.${NC}"
     fi
     rm -f "$pattern_file" "$BASE_DIR/panel_delete_payload.json" "$BASE_DIR/panel_hosts_filtered.json"
-    if [ "$host_rc" = "0" ]; then
-        echo -e "${GREEN}[+] Selected node(s) fully removed from Panel (core + hosts confirmed).${NC}"
-        return 0
-    fi
-    return 2
-}
-
-# ---- Pending Panel-cleanup queue -------------------------------------
-# Tracks nodes whose local Tor instance was removed (or is about to be)
-# while the matching Panel entry could NOT be confirmed removed -- so the
-# user always has a way to go back and finish the Panel side later,
-# instead of the node quietly staying orphaned on the Panel forever.
-PANEL_PENDING_FILE="$BASE_DIR/panel_pending_delete.tsv"
-
-panel_pending_queue_add() {
-    local reason="$1"; shift
-    mkdir -p "$BASE_DIR"; touch "$PANEL_PENDING_FILE"
-    local idx code name out_port
-    for idx in "$@"; do
-        IFS=':' read -r code name out_port <<< "${NODES[$idx]}"
-        grep -q "^${idx}$(printf '\t')" "$PANEL_PENDING_FILE" 2>/dev/null && continue
-        printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$idx" "$code" "$name" "$out_port" "$reason" "$(date +%s)" >> "$PANEL_PENDING_FILE"
-    done
-}
-
-panel_pending_queue_remove() {
-    local idx
-    [ -f "$PANEL_PENDING_FILE" ] || return 0
-    for idx in "$@"; do
-        grep -v "^${idx}$(printf '\t')" "$PANEL_PENDING_FILE" > "${PANEL_PENDING_FILE}.tmp" 2>/dev/null || true
-        mv -f "${PANEL_PENDING_FILE}.tmp" "$PANEL_PENDING_FILE"
-    done
-}
-
-panel_pending_queue_count() {
-    [ -f "$PANEL_PENDING_FILE" ] && [ -s "$PANEL_PENDING_FILE" ] && wc -l < "$PANEL_PENDING_FILE" | tr -d ' ' || echo 0
-}
-
-panel_pending_queue_show_and_retry() {
-    draw_header
-    echo -e "📌 ${MAGENTA}[ PENDING PANEL CLEANUP ]${NC}"
-    echo '────────────────────────────────────────────────────────────'
-    if [ "$(panel_pending_queue_count)" = "0" ]; then
-        echo -e "${GREEN}[+] Nothing pending -- Panel is in sync.${NC}"
-        read -r -p 'Press Enter...' < /dev/tty
-        return
-    fi
-    echo -e "  ${WHITE}#   Country/Name              Port   Queued reason${NC}"
-    local idx code name out_port reason ts
-    while IFS=$'\t' read -r idx code name out_port reason ts; do
-        [ -n "$idx" ] || continue
-        printf '  [%02s] %-24s %-6s %s\n' "$idx" "$name" "$out_port" "$reason"
-    done < "$PANEL_PENDING_FILE"
-    echo '────────────────────────────────────────────────────────────'
-    echo -e "These node(s) are gone locally but may still be listed on the Panel."
-    read -r -p 'Retry removing ALL of these from the Panel now? [y/N]: ' go < /dev/tty || return
-    if [[ "${go,,}" != "y" ]]; then return; fi
-    local -a ids=()
-    while IFS=$'\t' read -r idx _; do [ -n "$idx" ] && ids+=("$idx"); done < "$PANEL_PENDING_FILE"
-    panel_delete_node_ids "${ids[@]}"
-    local rc=$?
-    if [ "$rc" = "0" ]; then
-        panel_pending_queue_remove "${ids[@]}"
-        echo -e "${GREEN}[+] Panel cleanup queue cleared.${NC}"
-    else
-        echo -e "${YELLOW}[!] Still not fully confirmed on the Panel -- left in the queue for another retry.${NC}"
-    fi
-    read -r -p 'Press Enter...' < /dev/tty
+    echo -e "${GREEN}[+] Selected node(s) removed from Panel configuration.${NC}"
 }
 
 # ================= UI FUNCTIONS =================
@@ -1383,15 +1217,11 @@ draw_header() {
     echo -e "${MAGENTA} ║${CYAN}   ╚════██║██╔══██║██╔══╝  ██╔══██╗██║     ██║   ██║██║   ██║██╔═██╗ ${MAGENTA} ║${NC}"
     echo -e "${MAGENTA} ║${CYAN}   ███████║██║  ██║███████╗██║  ██║███████╗╚██████╔╝╚██████╔╝██║  ██╗${MAGENTA} ║${NC}"
     echo -e "${MAGENTA} ║${CYAN}   ╚══════╝╚═╝  ╚═╝╚══════╝╚═╝  ╚═╝╚══════╝ ╚═════╝  ╚═════╝ ╚═╝  ╚═╝${MAGENTA} ║${NC}"
-    echo -e "${MAGENTA} ║${YELLOW}          A U T O M A T E   E N G I N E   V 6 . 5 . 0                   ${MAGENTA}║${NC}"
+    echo -e "${MAGENTA} ║${YELLOW}          A U T O M A T E   E N G I N E   V 6 . 4 . 0                   ${MAGENTA}║${NC}"
     echo -e "${MAGENTA} ╚════════════════════════════════════════════════════════╝${NC}"
     local live_frame="${UI_SPINNER_FRAMES[$UI_SPINNER_INDEX]}"
     UI_SPINNER_INDEX=$(( (UI_SPINNER_INDEX + 1) % ${#UI_SPINNER_FRAMES[@]} ))
-    echo -e " ${CYAN}${live_frame}${NC} ${WHITE}Sherlook 6.5.0${NC} ${YELLOW}|${NC} Live Tor Engine ${CYAN}•${NC} country/IP verification ${GREEN}●${NC}"
-    if [ -n "${PANEL_PENDING_FILE:-}" ] && [ -s "${PANEL_PENDING_FILE:-/nonexistent}" ]; then
-        local pend_n; pend_n=$(wc -l < "$PANEL_PENDING_FILE" | tr -d ' ')
-        [ "$pend_n" != "0" ] && echo -e " ${YELLOW}⚠${NC}  ${YELLOW}${pend_n} node(s) waiting on a Panel cleanup retry${NC} ${WHITE}(Edit/Delete Nodes → option 5)${NC}"
-    fi
+    echo -e " ${CYAN}${live_frame}${NC} ${WHITE}Sherlook 6.4.1${NC} ${YELLOW}|${NC} Live Tor Engine ${CYAN}•${NC} country/IP verification ${GREEN}●${NC}"
     echo ""
 }
 
@@ -1494,7 +1324,7 @@ deploy_node() {
             elif [ "$fallback_mode" -eq 1 ]; then
                 echo -e "${CYAN}[*] Verifying fallback IP ${MAGENTA}$public_ip${CYAN} against GeoIP sources for ${WHITE}$route_code${WHITE}...${NC}"
                 local fb_result fb_bad fb_actual fb_reason fb_seen
-                fb_result=$(check_ip_quality "$public_ip" "$route_code" 1 0)
+                fb_result=$(check_ip_quality "$public_ip" "$route_code" 1)
                 IFS='|' read -r fb_bad fb_actual fb_reason fb_seen <<< "$fb_result"
                 if [ "$fb_bad" = "0" ]; then
                     printf '%s\n' "$public_ip" > "$ip_file"
@@ -1746,7 +1576,7 @@ rotate_one_node_core() {
                 [ "$silent" = "1" ] || echo -e "${YELLOW}  • $code received a previously-seen IP $new_ip; forcing a new Tor instance (attempt $attempt/$NODE_ROTATE_RETRIES)${NC}"
             else
                 seen_ips["$new_ip"]=1
-                result=$(check_ip_quality "$new_ip" "$expected_route" 0 0)
+                result=$(check_ip_quality "$new_ip" "$expected_route")
                 IFS='|' read -r bad actual reason seen <<< "$result"
                 if [ "$reason" = "GEOIP_UNAVAILABLE" ]; then
                     printf '%s\n' "$new_ip" > "$ip_file"
@@ -2223,27 +2053,11 @@ edit_delete_nodes() {
     repair_ids() { compute_effective_parallel; local max_jobs=$EFFECTIVE_PARALLEL jobs=0; local -a pids=(); local idx code name out_port; for idx in "$@"; do IFS=':' read -r code name out_port <<< "${NODES[$idx]}"; [ -f "$BASE_DIR/node_${code}_${out_port}.conf" ] || continue; rotate_one_node "$code" "$name" "$out_port" 0 & pids+=("$!"); jobs=$((jobs+1)); if ((jobs>=max_jobs)); then wait "${pids[0]}" 2>/dev/null || true; pids=("${pids[@]:1}"); jobs=$((jobs-1)); fi; done; for pid in "${pids[@]}"; do wait "$pid" 2>/dev/null || true; done; }
     while true; do
         draw_header; echo -e "📌 ${MAGENTA}[ NODE MAINTENANCE ]${NC}"; echo '────────────────────────────────────────────────────────────'
-        local idx code name out_port st st_color
-        for idx in "${ORDER[@]}"; do
-            IFS=':' read -r code name out_port <<< "${NODES[$idx]}"
-            [ -f "$BASE_DIR/node_${code}_${out_port}.conf" ] || continue
-            st='UNKNOWN'; state_get "$code" "$out_port" && st="$STATUS"
-            case "$st" in
-                ONLINE) st_color="${GREEN}${st}${NC}" ;;
-                ONLINE_UNVERIFIED) st_color="${CYAN}${st}${NC}" ;;
-                DEAD|SOCKS_DEAD|EXIT_GEOIP_FAIL) st_color="${RED}${st}${NC}" ;;
-                QUARANTINED*) st_color="${YELLOW}${st}${NC}" ;;
-                *) st_color="${WHITE}${st}${NC}" ;;
-            esac
-            printf '[%02s] %-20s %-8s %b\n' "$idx" "$name" "$out_port" "$st_color"
-        done
+        local idx code name out_port st
+        for idx in "${ORDER[@]}"; do IFS=':' read -r code name out_port <<< "${NODES[$idx]}"; [ -f "$BASE_DIR/node_${code}_${out_port}.conf" ] || continue; st='UNKNOWN'; state_get "$code" "$out_port" && st="$STATUS"; printf '[%02s] %-20s %-8s %s\n' "$idx" "$name" "$out_port" "$st"; done
         echo '────────────────────────────────────────────────────────────'
-        local pend; pend=$(panel_pending_queue_count)
         echo '[1] Repair selected       [2] Delete local selected'
         echo '[3] Delete local + Panel  [4] Refresh'
-        if [ "$pend" != "0" ]; then
-            echo -e "[5] ${YELLOW}Retry pending Panel cleanup (${pend})${NC}"
-        fi
         echo '[0] Back'
         read -r -p 'Select action: ' action < /dev/tty || return
         case "$action" in
@@ -2251,37 +2065,10 @@ edit_delete_nodes() {
                 read -r -p 'Node IDs (e.g. 1-21,25): ' selection < /dev/tty || continue
                 mapfile -t selected < <(parse_node_selection "$selection"); [ ${#selected[@]} -gt 0 ] || { echo '[!] No valid IDs.'; sleep 1; continue; }
                 if [ "$action" = 1 ]; then repair_ids "${selected[@]}"; fi
-                if [ "$action" = 2 ]; then
-                    read -r -p 'Type DELETE to confirm (LOCAL ONLY -- Panel entries will stay behind): ' c < /dev/tty
-                    if [ "$c" = DELETE ]; then delete_local_ids "${selected[@]}"; fi
-                fi
-                if [ "$action" = 3 ]; then
-                    read -r -p 'Type DELETE to confirm local+panel removal: ' c < /dev/tty
-                    if [ "$c" = DELETE ]; then
-                        panel_delete_node_ids "${selected[@]}"
-                        local panel_rc=$?
-                        if [ "$panel_rc" = "0" ]; then
-                            delete_local_ids "${selected[@]}"
-                            panel_pending_queue_remove "${selected[@]}"
-                            echo -e "${GREEN}[+] Removed locally and from the Panel.${NC}"
-                        elif [ "$panel_rc" = "2" ]; then
-                            delete_local_ids "${selected[@]}"
-                            panel_pending_queue_add "core-ok-hosts-unconfirmed" "${selected[@]}"
-                            echo -e "${YELLOW}[!] Removed locally. The Panel's core config was updated but its Hosts list could not be confirmed -- queued for retry (menu option 5).${NC}"
-                        else
-                            echo -e "${RED}[!] Panel removal failed, so nothing was deleted locally either (your node is untouched). Fix the Panel connection (option 9) and try again.${NC}"
-                            read -r -p 'Delete locally anyway and queue the Panel cleanup for later? [y/N]: ' force < /dev/tty
-                            if [[ "${force,,}" = "y" ]]; then
-                                delete_local_ids "${selected[@]}"
-                                panel_pending_queue_add "panel-delete-failed" "${selected[@]}"
-                                echo -e "${YELLOW}[!] Deleted locally and queued for a later Panel cleanup retry (menu option 5).${NC}"
-                            fi
-                        fi
-                    fi
-                fi
+                if [ "$action" = 2 ]; then read -r -p 'Type DELETE to confirm: ' c < /dev/tty; [ "$c" = DELETE ] && delete_local_ids "${selected[@]}"; fi
+                if [ "$action" = 3 ]; then read -r -p 'Type DELETE to confirm local+panel removal: ' c < /dev/tty; if [ "$c" = DELETE ]; then panel_delete_node_ids "${selected[@]}" || true; delete_local_ids "${selected[@]}"; fi; fi
                 read -r -p 'Press Enter...' < /dev/tty
                 ;;
-            5) [ "$pend" != "0" ] && panel_pending_queue_show_and_retry ;;
             4) continue ;;
             0) return ;;
         esac
@@ -2315,31 +2102,16 @@ panel_menu() {
     while true; do
         draw_header
         echo -e "📌 ${MAGENTA}[ NEXATIS CONTROL PANEL ]${NC}"
-        local pend; pend=$(panel_pending_queue_count)
         echo '[1] Configure/validate templates'
         echo '[2] Add installed nodes to Panel'
-        echo '[3] Delete selected nodes from Panel (Panel side only)'
-        if [ "$pend" != "0" ]; then
-            echo -e "[5] ${YELLOW}Retry pending Panel cleanup (${pend})${NC}"
-        fi
+        echo '[3] Delete selected nodes from Panel'
         echo '[4] Logout'
         echo '[0] Back'
         read -r -p 'Selected option: ' panel_opt < /dev/tty || return
         case "$panel_opt" in
             1) panel_prepare_templates; read -r -p 'Press Enter...' < /dev/tty ;;
             2) panel_batch_create ;;
-            3)
-                read -r -p 'Node IDs: ' s < /dev/tty || continue
-                mapfile -t ids < <(printf '%s\n' "$s" | sed 's/;/,/g' | awk -F',' '{for(i=1;i<=NF;i++) print $i}' | while read -r x; do if [[ "$x" =~ ^([0-9]+)-([0-9]+)$ ]]; then for ((n=BASH_REMATCH[1];n<=BASH_REMATCH[2];n++)); do printf "%02d\n" "$n"; done; else [[ "$x" =~ ^[0-9]+$ ]] && printf "%02d\n" "$x"; fi; done | sort -u)
-                if [ ${#ids[@]} -gt 0 ]; then
-                    panel_delete_node_ids "${ids[@]}"
-                    local rc=$?
-                    [ "$rc" = "0" ] && panel_pending_queue_remove "${ids[@]}"
-                    [ "$rc" = "2" ] && panel_pending_queue_add "core-ok-hosts-unconfirmed" "${ids[@]}"
-                fi
-                read -r -p 'Press Enter...' < /dev/tty
-                ;;
-            5) [ "$pend" != "0" ] && panel_pending_queue_show_and_retry ;;
+            3) read -r -p 'Node IDs: ' s < /dev/tty || continue; mapfile -t ids < <(printf '%s\n' "$s" | sed 's/;/,/g' | awk -F',' '{for(i=1;i<=NF;i++) print $i}' | while read -r x; do if [[ "$x" =~ ^([0-9]+)-([0-9]+)$ ]]; then for ((n=BASH_REMATCH[1];n<=BASH_REMATCH[2];n++)); do printf "%02d\n" "$n"; done; else [[ "$x" =~ ^[0-9]+$ ]] && printf "%02d\n" "$x"; fi; done | sort -u); [ ${#ids[@]} -gt 0 ] && panel_delete_node_ids "${ids[@]}"; read -r -p 'Press Enter...' < /dev/tty ;;
             4) rm -f "$PANEL_CONF"; unset URL USER TOKEN; echo '[+] Logged out.'; return ;;
             0) return ;;
         esac
