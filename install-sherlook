@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Sherlook Engine Installer v6.4.1
+# Sherlook Engine Installer v6.5.0
 # GitHub-ready installer for SherlookHolmz/multi.
 set -euo pipefail
 
@@ -14,7 +14,7 @@ API_BASE="https://api.github.com/repos/$OWNER_REPO"
 INSTALL_PATH="/usr/local/bin/sherlook"
 BASE_DIR="/etc/tor/sherlook_nodes"
 DATA_DIR="/var/lib/tor/sherlook_nodes"
-VERSION="6.4.1"
+VERSION="6.5.0"
 
 check_root() {
     [ "$EUID" -eq 0 ] || {
@@ -87,7 +87,7 @@ main() {
         "$RAW_BASE/$commit/sherlook.sh"
 
     bash -n "$tmp"
-    grep -q '^SHERLOOK_VERSION="6\.4\.1"$' "$tmp" || {
+    grep -q '^SHERLOOK_VERSION="6\.5\.0"$' "$tmp" || {
         echo -e "${RED}[!] Remote engine version mismatch; expected $VERSION.${NC}"
         exit 1
     }
@@ -125,6 +125,15 @@ RestartSec=2
 User=root
 MemoryMax=256M
 NoNewPrivileges=false
+# CPU/IO safety net (v6.5.0): the engine itself now checks less often and
+# does far fewer GeoIP calls per cycle, but these limits are a second,
+# independent guard so a burst (many nodes down at once, a slow GeoIP
+# provider, etc.) can never starve Tor, sshd, or anything else on the box.
+Nice=10
+CPUWeight=25
+IOWeight=25
+CPUQuota=60%
+TasksMax=200
 
 [Install]
 WantedBy=multi-user.target
@@ -148,7 +157,8 @@ CRON
 
     echo -e "${GREEN}[+] Installed Sherlook v$VERSION${NC}"
     echo -e "${GREEN}[+] Pinned commit: $commit${NC}"
-    echo -e "${GREEN}[+] Auto-heal service is active.${NC}"
+    echo -e "${GREEN}[+] Auto-heal service is active (lighter CPU footprint + CPU/IO caps applied).${NC}"
+    echo -e "${CYAN}[i] Panel deletions now fail safely: 'Edit/Delete Nodes' → option 5 shows and retries any node whose Panel-side cleanup didn't fully confirm.${NC}"
 }
 
 main "$@"
