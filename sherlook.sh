@@ -2417,16 +2417,37 @@ panel_sync_single() {
 panel_batch_create() {
     source "$PANEL_CONF" 2>/dev/null || true
 
+    # BUGFIX: this used to require node_is_installed() -- conf file present
+    # AND a Tor process currently running AND a freshly-verified IP RIGHT
+    # NOW. That is the correct check for "should I redeploy this?" but it
+    # is the wrong check here: a node that is mid-rotation, briefly
+    # quarantined, or was knocked over by a transient issue is still a
+    # node you deployed and still want addable to the Panel -- it doesn't
+    # stop being "yours" just because it's between circuits for 10 seconds.
+    # Using that strict live-process check here meant a single bad
+    # auto-heal cycle (or just bad timing) could make EVERY deployed node
+    # invisible to the Panel screen at once, i.e. exactly the "No
+    # installed Tor nodes found" report even with nodes clearly deployed.
+    # node_has_record() only checks that the node was deployed (its conf
+    # file exists), which is what "installed" should mean for this list.
     local installed=()
+    local -A status_note=()
     for idx in "${ORDER[@]}"; do
         IFS=':' read -r code name out_port <<< "${NODES[$idx]}"
-        if node_is_installed "$code" "$out_port"; then
+        if node_has_record "$code" "$out_port"; then
             installed+=("$idx")
+            if node_is_installed "$code" "$out_port"; then
+                status_note[$idx]="${GREEN}online${NC}"
+            else
+                status_note[$idx]="${YELLOW}not currently online -- will still be added${NC}"
+            fi
         fi
     done
 
     if [ ${#installed[@]} -eq 0 ]; then
-        echo -e "\n${RED}[!] No installed Tor nodes found. Please install nodes first.${NC}"; sleep 2; return
+        echo -e "\n${RED}[!] No deployed Tor nodes found (no node_*.conf files under $BASE_DIR).${NC}"
+        echo -e "${YELLOW}[!] Install nodes first with menu option [4] or [5].${NC}"
+        sleep 2; return
     fi
 
     echo -e "\n📌 ${MAGENTA}[ INSTALLED NODES TO ADD ]${NC}"
@@ -2434,7 +2455,7 @@ panel_batch_create() {
     for idx in "${installed[@]}"; do
         IFS=':' read -r code name out_port <<< "${NODES[$idx]}"
         local emoji="${EMOJIS[$code]}"
-        printf "  ${CYAN}[%s]${NC} %s %-18s \tTorPort:${MAGENTA}%s${NC}\n" "$idx" "$emoji" "$name" "$out_port"
+        printf "  ${CYAN}[%s]${NC} %s %-18s \tTorPort:${MAGENTA}%s${NC}  %b\n" "$idx" "$emoji" "$name" "$out_port" "${status_note[$idx]}"
     done
     echo -e "${BLUE}──────────────────────────────────────────────────────────────────${NC}"
 
@@ -2834,6 +2855,40 @@ if [ "${1:-}" = "--install" ]; then
 fi
 
 # ================= MENU LOOP =================
+toggle_auto_heal() {
+    check_root
+    draw_header
+    echo -e "📌 ${MAGENTA}[ AUTO-HEAL SERVICE ]${NC}\n"
+    if systemctl is-active --quiet sherlook-heal.service 2>/dev/null; then
+        echo -e "${GREEN}Auto-Heal is currently ACTIVE.${NC}"
+        echo -e "${YELLOW}[!] While active, it will stop/restart any node it judges unhealthy${NC}"
+        echo -e "${YELLOW}    (dead process, SOCKS unreachable, or wrong-country IP).${NC}\n"
+        echo -e "  ${CYAN}[1]${NC} Stop it for this boot only (systemctl stop)"
+        echo -e "  ${CYAN}[2]${NC} Stop it AND disable it permanently (survives reboot)"
+        echo -e "  ${RED}[0]${NC} Leave it running / go back"
+        read -r -p "Choice [0-2]: " ah_choice < /dev/tty || return
+        case "$ah_choice" in
+            1) systemctl stop sherlook-heal.service; echo -e "${GREEN}[+] Stopped. It will come back on the next reboot.${NC}" ;;
+            2) systemctl disable --now sherlook-heal.service; echo -e "${GREEN}[+] Stopped and disabled. It will NOT come back automatically.${NC}" ;;
+            *) echo -e "${CYAN}[*] No change.${NC}" ;;
+        esac
+    else
+        echo -e "${YELLOW}Auto-Heal is currently INACTIVE.${NC}"
+        echo -e "${CYAN}[!] Nodes that die or drift off-country will NOT be repaired automatically${NC}"
+        echo -e "${CYAN}    while it's off -- use option [8] to rotate them by hand instead.${NC}\n"
+        echo -e "  ${CYAN}[1]${NC} Start it now and enable it (recommended)"
+        echo -e "  ${CYAN}[2]${NC} Start it for this boot only (won't survive reboot)"
+        echo -e "  ${RED}[0]${NC} Leave it off / go back"
+        read -r -p "Choice [0-2]: " ah_choice < /dev/tty || return
+        case "$ah_choice" in
+            1) systemctl enable --now sherlook-heal.service; echo -e "${GREEN}[+] Started and enabled.${NC}" ;;
+            2) systemctl start sherlook-heal.service; echo -e "${GREEN}[+] Started for this boot only.${NC}" ;;
+            *) echo -e "${CYAN}[*] No change.${NC}" ;;
+        esac
+    fi
+    sleep 2
+}
+
 while true; do
     draw_header
     if command -v tor &> /dev/null && command -v jq &> /dev/null; then
@@ -2855,18 +2910,19 @@ while true; do
     echo -e "  ${GREEN}[6]${NC} ${WHITE}»${NC} View Active Nodes"
     echo -e "  ${GREEN}[7]${NC} ${WHITE}»${NC} Edit or Delete Nodes"
     echo -e "  ${CYAN}[8]${NC} ${WHITE}»${NC} 🔄 Change IP / IP Rotation"
+    echo -e "  ${CYAN}[A]${NC} ${WHITE}»${NC} Toggle Auto-Heal Service (on/off)"
     echo -e "${BLUE} ────────────────────────────────────────────────────────${NC}"
     echo -e "  ${YELLOW}[9]${NC} ${WHITE}»${NC} Panel Nexatis Integration"
     echo -e "${BLUE} ────────────────────────────────────────────────────────${NC}"
     echo -e "  ${RED}[0]${NC} ${WHITE}»${NC} Exit Program"
     echo -e "${BLUE} ────────────────────────────────────────────────────────${NC}\n"
 
-    if ! read -r -p "$(echo -e ${MAGENTA}"Enter choice [0-9]: "${NC})" main_choice < /dev/tty; then
+    if ! read -r -p "$(echo -e ${MAGENTA}"Enter choice [0-9/A]: "${NC})" main_choice < /dev/tty; then
         echo -e "\n${RED}[!] No terminal input available (are you piping this, e.g. curl | bash?). Exiting.${NC}"
         exit 1
     fi
 
-    case $main_choice in
+    case "${main_choice,,}" in
         1) install_engine ;;
         2) update_system ;;
         8) change_ip_menu ;;
@@ -2875,6 +2931,7 @@ while true; do
         5) bulk_add_nodes ;;
         6) view_active_nodes ;;
         7) edit_delete_nodes ;;
+        a) toggle_auto_heal ;;
         9) check_root; panel_login ;;
         0) clear; exit 0 ;;
         *) ;;
