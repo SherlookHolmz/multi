@@ -123,12 +123,19 @@ ExecStart=$INSTALL_PATH --auto-heal-daemon
 Restart=always
 RestartSec=2
 User=root
-MemoryMax=256M
+MemoryMax=2G
 NoNewPrivileges=false
 # CPU/IO safety net (v6.5.0): the engine itself now checks less often and
 # does far fewer GeoIP calls per cycle, but these limits are a second,
 # independent guard so a burst (many nodes down at once, a slow GeoIP
 # provider, etc.) can never starve Tor, sshd, or anything else on the box.
+# MemoryMax was raised from 256M -> 2G (bugfix): every Tor process that
+# auto-heal restarts (rotation/repair) becomes a CHILD of this service's
+# cgroup, not a sibling. At 256M, rotating even ~8-10 nodes around the
+# same auto-heal cycle could blow the cgroup's memory budget, and the
+# kernel OOM-killer then kills processes inside that cgroup -- which can
+# take out multiple/most running Tor nodes at once, not just one. That is
+# very likely what looked like "all my nodes suddenly got wiped."
 Nice=10
 CPUWeight=25
 IOWeight=25
