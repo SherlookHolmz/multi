@@ -2476,7 +2476,7 @@ panel_batch_create() {
 
     echo -e "${CYAN}    > Searching for Cores...${NC}"
     for ep in "${core_endpoints[@]}"; do
-        local test_resp=$(curl -s -X GET "$URL$ep/1" -H "Authorization: Bearer $TOKEN" -H "accept: application/json" | tr -d '\0')
+        local test_resp=$(curl -s --connect-timeout 10 --max-time 20 -X GET "$URL$ep/1" -H "Authorization: Bearer $TOKEN" -H "accept: application/json" | tr -d '\0')
         local extracted=$(extract_json_from_response "$test_resp")
 
         if [ -n "$extracted" ]; then
@@ -2486,11 +2486,11 @@ panel_batch_create() {
             break
         fi
 
-        local list_resp=$(curl -s -X GET "$URL$ep" -H "Authorization: Bearer $TOKEN" -H "accept: application/json" | tr -d '\0')
+        local list_resp=$(curl -s --connect-timeout 10 --max-time 20 -X GET "$URL$ep" -H "Authorization: Bearer $TOKEN" -H "accept: application/json" | tr -d '\0')
         local core_ids=$(echo "$list_resp" | jq -r '.[].id // .data[].id // empty' 2>/dev/null | head -n 1)
 
         if [ -n "$core_ids" ]; then
-            local fetch_resp=$(curl -s -X GET "$URL$ep/$core_ids" -H "Authorization: Bearer $TOKEN" -H "accept: application/json" | tr -d '\0')
+            local fetch_resp=$(curl -s --connect-timeout 10 --max-time 20 -X GET "$URL$ep/$core_ids" -H "Authorization: Bearer $TOKEN" -H "accept: application/json" | tr -d '\0')
             local extracted2=$(extract_json_from_response "$fetch_resp")
             if [ -n "$extracted2" ]; then
                 echo "$extracted2" > "$CORE_FILE"
@@ -2502,10 +2502,10 @@ panel_batch_create() {
     done
 
     if [ $found_config -eq 0 ]; then
-        local nodes_resp=$(curl -s -X GET "$URL/api/nodes" -H "Authorization: Bearer $TOKEN" -H "accept: application/json" | tr -d '\0')
+        local nodes_resp=$(curl -s --connect-timeout 10 --max-time 20 -X GET "$URL/api/nodes" -H "Authorization: Bearer $TOKEN" -H "accept: application/json" | tr -d '\0')
         local node_ids=$(echo "$nodes_resp" | jq -r '.[].id // .data[].id // empty' 2>/dev/null)
         for nid in $node_ids; do
-            local n_resp=$(curl -s -X GET "$URL/api/node/$nid" -H "Authorization: Bearer $TOKEN" -H "accept: application/json" | tr -d '\0')
+            local n_resp=$(curl -s --connect-timeout 10 --max-time 20 -X GET "$URL/api/node/$nid" -H "Authorization: Bearer $TOKEN" -H "accept: application/json" | tr -d '\0')
             local extracted3=$(extract_json_from_response "$n_resp")
             if [ -n "$extracted3" ]; then
                 echo "$extracted3" > "$CORE_FILE"
@@ -2559,7 +2559,7 @@ panel_batch_create() {
     local clone_host_json="{}"
     local HOSTS_FILE="$BASE_DIR/panel_hosts.json"
 
-    local hosts_resp=$(curl -s -X GET "$URL/api/hosts" -H "Authorization: Bearer $TOKEN" -H "accept: application/json" | tr -d '\0')
+    local hosts_resp=$(curl -s --connect-timeout 10 --max-time 20 -X GET "$URL/api/hosts" -H "Authorization: Bearer $TOKEN" -H "accept: application/json" | tr -d '\0')
     local is_array=$(echo "$hosts_resp" | jq -r 'type == "array"' 2>/dev/null)
 
     if [ "$is_array" == "true" ]; then
@@ -2635,6 +2635,37 @@ panel_batch_create() {
     cp "$CORE_FILE" "$FINAL_FILE"
     echo "[]" > "$NEW_HOSTS_FILE"
 
+    # PERFORMANCE FIX: the old version re-parsed and re-wrote the ENTIRE
+    # $FINAL_FILE (a full clone of the panel's live Xray config -- which
+    # only grows over time as more nodes get added across every past run)
+    # THREE separate times per selected node, using a brand-new jq process
+    # each time. For a big batch ("all" countries) against a config that
+    # has accumulated a lot of history, that is O(N) full-file rewrites of
+    # an ever-larger file -- it does not hang forever, but it can go from
+    # "instant" to "many minutes with zero visible progress" as the config
+    # grows, which looks exactly like a freeze at "Generating Inbounds...".
+    # Fix: accumulate the new inbounds/outbounds/routing rules in small
+    # side files (cheap to rewrite every iteration since they only ever
+    # contain what THIS run is adding) and merge them into $FINAL_FILE
+    # with exactly one jq pass each, after the loop.
+    local NEW_INBOUNDS_FILE="$BASE_DIR/new_inbounds.json"
+    local NEW_OUTBOUNDS_FILE="$BASE_DIR/new_outbounds.json"
+    local NEW_ROUTES_FILE="$BASE_DIR/new_routes.json"
+    echo "[]" > "$NEW_INBOUNDS_FILE"
+    echo "[]" > "$NEW_OUTBOUNDS_FILE"
+    echo "[]" > "$NEW_ROUTES_FILE"
+
+    # Seed the used-port/tag tracking ONCE from the original config instead
+    # of re-querying the (growing) file on every single node.
+    local -A used_ports=() used_intags=() used_outtags=()
+    local _v
+    while IFS= read -r _v; do [ -n "$_v" ] && used_ports["$_v"]=1; done \
+        < <(jq -r '.inbounds[]?.port // empty' "$FINAL_FILE" 2>/dev/null)
+    while IFS= read -r _v; do [ -n "$_v" ] && used_intags["$_v"]=1; done \
+        < <(jq -r '.inbounds[]?.tag // empty' "$FINAL_FILE" 2>/dev/null)
+    while IFS= read -r _v; do [ -n "$_v" ] && used_outtags["$_v"]=1; done \
+        < <(jq -r '.outbounds[]?.tag // empty' "$FINAL_FILE" 2>/dev/null)
+
     for idx in "${selected_nodes[@]}"; do
         IFS=':' read -r code name out_port <<< "${NODES[$idx]}"
         local emoji="${EMOJIS[$code]}"
@@ -2657,26 +2688,25 @@ panel_batch_create() {
             in_tag="${code}-${safe_name}-IN-${rand_port}"
             out_tag="${code}-${safe_name}-OUT-${out_port}"
 
-            local port_exists=$(jq -e ".inbounds[]? | select(.port == $rand_port)" "$FINAL_FILE" >/dev/null 2>&1 && echo "yes" || echo "no")
-            local in_tag_exists=$(jq -e ".inbounds[]? | select(.tag == \"$in_tag\")" "$FINAL_FILE" >/dev/null 2>&1 && echo "yes" || echo "no")
-            local out_tag_exists=$(jq -e ".outbounds[]? | select(.tag == \"$out_tag\")" "$FINAL_FILE" >/dev/null 2>&1 && echo "yes" || echo "no")
-
-            if [[ "$port_exists" == "no" && "$in_tag_exists" == "no" && "$out_tag_exists" == "no" ]]; then
+            if [[ -z "${used_ports[$rand_port]:-}" && -z "${used_intags[$in_tag]:-}" && -z "${used_outtags[$out_tag]:-}" ]]; then
                 break
             fi
         done
+        used_ports["$rand_port"]=1
+        used_intags["$in_tag"]=1
+        used_outtags["$out_tag"]=1
 
         jq --arg p "$rand_port" --arg t "$in_tag" --argjson obj "$clone_inbound_json" \
-           'if .inbounds == null then .inbounds = [] else . end | .inbounds += [($obj | .port=($p|tonumber) | .tag=$t)]' \
-           "$FINAL_FILE" > "$BASE_DIR/tmp.json" && mv -f "$BASE_DIR/tmp.json" "$FINAL_FILE"
+           '. += [($obj | .port=($p|tonumber) | .tag=$t)]' \
+           "$NEW_INBOUNDS_FILE" > "$BASE_DIR/tmp_ib.json" && mv -f "$BASE_DIR/tmp_ib.json" "$NEW_INBOUNDS_FILE"
 
         jq --arg t "$out_tag" --arg p "$out_port" \
-           'if has("outbounds") and .outbounds != null then . else .outbounds = [] end | .outbounds += [{"tag": $t, "protocol": "socks", "settings": {"servers": [{"address": "127.0.0.1", "port": ($p|tonumber)}]}}]' \
-           "$FINAL_FILE" > "$BASE_DIR/tmp.json" && mv -f "$BASE_DIR/tmp.json" "$FINAL_FILE"
+           '. += [{"tag": $t, "protocol": "socks", "settings": {"servers": [{"address": "127.0.0.1", "port": ($p|tonumber)}]}}]' \
+           "$NEW_OUTBOUNDS_FILE" > "$BASE_DIR/tmp_ob.json" && mv -f "$BASE_DIR/tmp_ob.json" "$NEW_OUTBOUNDS_FILE"
 
         jq --arg intag "$in_tag" --arg outtag "$out_tag" \
-           'if has("routing") and .routing != null then . else .routing = {"rules": []} end | if .routing.rules == null then .routing.rules = [] else . end | .routing.rules += [{"type": "field", "inboundTag": [$intag], "outboundTag": $outtag}]' \
-           "$FINAL_FILE" > "$BASE_DIR/tmp.json" && mv -f "$BASE_DIR/tmp.json" "$FINAL_FILE"
+           '. += [{"type": "field", "inboundTag": [$intag], "outboundTag": $outtag}]' \
+           "$NEW_ROUTES_FILE" > "$BASE_DIR/tmp_rt.json" && mv -f "$BASE_DIR/tmp_rt.json" "$NEW_ROUTES_FILE"
 
         if [ "$clone_host_json" != "{}" ] && [ "$clone_host_json" != "null" ]; then
             jq --arg tag "$in_tag" --arg p "$rand_port" --arg rem "$new_remark" --argjson obj "$clone_host_json" \
@@ -2691,11 +2721,23 @@ panel_batch_create() {
         echo -e "  ⚙️  $emoji $name | In:$rand_port ➔ Out:$out_port Prepared."
     done
 
+    echo -e "  ${CYAN}> Merging generated inbounds/outbounds/routing into the core config...${NC}"
+    jq --slurpfile ib "$NEW_INBOUNDS_FILE" \
+       'if .inbounds == null then .inbounds = [] else . end | .inbounds += $ib[0]' \
+       "$FINAL_FILE" > "$BASE_DIR/tmp.json" && mv -f "$BASE_DIR/tmp.json" "$FINAL_FILE"
+    jq --slurpfile ob "$NEW_OUTBOUNDS_FILE" \
+       'if has("outbounds") and .outbounds != null then . else .outbounds = [] end | .outbounds += $ob[0]' \
+       "$FINAL_FILE" > "$BASE_DIR/tmp.json" && mv -f "$BASE_DIR/tmp.json" "$FINAL_FILE"
+    jq --slurpfile rt "$NEW_ROUTES_FILE" \
+       'if has("routing") and .routing != null then . else .routing = {"rules": []} end | if .routing.rules == null then .routing.rules = [] else . end | .routing.rules += $rt[0]' \
+       "$FINAL_FILE" > "$BASE_DIR/tmp.json" && mv -f "$BASE_DIR/tmp.json" "$FINAL_FILE"
+    rm -f "$NEW_INBOUNDS_FILE" "$NEW_OUTBOUNDS_FILE" "$NEW_ROUTES_FILE"
+
     echo -e "\n🚀 ${MAGENTA}[ UPLOADING DIRECTLY TO PANEL VIA API ]${NC}"
     echo -e "${BLUE}────────────────────────────────────────────────────────────${NC}"
 
     if [ -n "$CORE_API_URL" ]; then
-        local original_core_resp=$(curl -s -X GET "$CORE_API_URL" -H "Authorization: Bearer $TOKEN" -H "accept: application/json" | tr -d '\0')
+        local original_core_resp=$(curl -s --connect-timeout 10 --max-time 20 -X GET "$CORE_API_URL" -H "Authorization: Bearer $TOKEN" -H "accept: application/json" | tr -d '\0')
         local core_obj=$(echo "$original_core_resp" | jq -r 'if type == "object" and has("data") then .data else . end')
         if [ -z "$core_obj" ] || [ "$core_obj" == "null" ]; then core_obj="{}"; fi
 
@@ -2748,7 +2790,7 @@ panel_batch_create() {
         done
 
         if [ $h_success -eq 0 ] && [[ "$h_code" == "405" || "$h_code" == "404" ]]; then
-            local current_hosts=$(curl -s -X GET "$URL/api/hosts" -H "Authorization: Bearer $TOKEN" -H "accept: application/json" | tr -d '\0')
+            local current_hosts=$(curl -s --connect-timeout 10 --max-time 20 -X GET "$URL/api/hosts" -H "Authorization: Bearer $TOKEN" -H "accept: application/json" | tr -d '\0')
             local is_arr=$(echo "$current_hosts" | jq 'type == "array"' 2>/dev/null)
 
             if [ "$is_arr" == "true" ]; then
