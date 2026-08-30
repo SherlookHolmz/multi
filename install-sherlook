@@ -1,7 +1,6 @@
 #!/usr/bin/env bash
 # Sherlook Automate Engine Installer v7.0.0
-# Installs the local fixed engine when it is next to this installer.
-# Remote fallback is optional and configurable through SHERLOOK_REPO/SHERLOOK_BRANCH.
+# Installs the Emoji/PasarGuard Batch-Host fix.
 set -euo pipefail
 
 RED='\033[1;31m'; GREEN='\033[1;32m'; YELLOW='\033[1;33m'
@@ -11,27 +10,57 @@ VERSION="7.0.0"
 INSTALL_PATH="/usr/local/bin/sherlook"
 BASE_DIR="/etc/tor/sherlook_nodes"
 DATA_DIR="/var/lib/tor/sherlook_nodes"
+
 SHERLOOK_REPO="${SHERLOOK_REPO:-SherlookHolmz/multi}"
 SHERLOOK_BRANCH="${SHERLOOK_BRANCH:-main}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# IMPORTANT:
+# Keep this installer in the same directory as the fixed engine whenever possible.
 LOCAL_ENGINE="$SCRIPT_DIR/sherlook-fixed-7.0.0.sh"
 
-check_root() { [ "$EUID" -eq 0 ] || { echo -e "${RED}[!] Run as root.${NC}"; exit 1; }; }
-need_cmd() { command -v "$1" >/dev/null 2>&1 || { echo -e "${RED}[!] Missing command: $1${NC}"; exit 1; }; }
+check_root() {
+    [ "$EUID" -eq 0 ] || {
+        echo -e "${RED}[!] Run as root.${NC}"
+        exit 1
+    }
+}
+
+need_cmd() {
+    command -v "$1" >/dev/null 2>&1 || {
+        echo -e "${RED}[!] Missing command: $1${NC}"
+        exit 1
+    }
+}
 
 fetch_remote_engine() {
     local api="https://api.github.com/repos/$SHERLOOK_REPO/commits/$SHERLOOK_BRANCH"
     local raw="https://raw.githubusercontent.com/$SHERLOOK_REPO"
     local commit tmp
-    commit=$(curl -4 -fsSL --connect-timeout 10 --max-time 30 -H 'Accept: application/vnd.github+json' "$api" | jq -r '.sha // empty')
-    [[ "$commit" =~ ^[0-9a-f]{40}$ ]] || { echo -e "${RED}[!] Could not resolve $SHERLOOK_REPO@$SHERLOOK_BRANCH.${NC}"; exit 1; }
+
+    commit=$(curl -4 -fsSL --connect-timeout 10 --max-time 30 \
+        -H 'Accept: application/vnd.github+json' "$api" |
+        jq -r '.sha // empty')
+
+    [[ "$commit" =~ ^[0-9a-f]{40}$ ]] || {
+        echo -e "${RED}[!] Could not resolve $SHERLOOK_REPO@$SHERLOOK_BRANCH.${NC}"
+        exit 1
+    }
+
     tmp=$(mktemp /tmp/sherlook-engine.XXXXXX)
-    trap 'rm -f "$tmp"' RETURN
-    curl -4 -fsSL --connect-timeout 10 --max-time 120 -o "$tmp" "$raw/$commit/sherlook.sh"
+    trap 'rm -f "$tmp" "$tmp.patched"' RETURN
+
+    # Only fetch the FIXED engine. Do not silently fall back to the old sherlook.sh.
+    curl -4 -fsSL --connect-timeout 10 --max-time 120 \
+        -o "$tmp" \
+        "$raw/$commit/sherlook-fixed-7.0.0.sh"
+
     bash -n "$tmp"
-    grep -q '^SHERLOOK_VERSION="7\.0\.0"$' "$tmp" || { echo -e "${RED}[!] Remote engine is not v$VERSION.${NC}"; exit 1; }
-    sed "s/^PINNED_COMMIT=\"__INSTALLER_RESOLVES__\"/PINNED_COMMIT=\"$commit\"/" "$tmp" > "$tmp.patched"
-    mv -f "$tmp.patched" "$tmp"
+    grep -q '^SHERLOOK_VERSION="7\.0\.0"$' "$tmp" || {
+        echo -e "${RED}[!] Remote engine is not v$VERSION.${NC}"
+        exit 1
+    }
+
     printf '%s\n' "$tmp"
 }
 
@@ -58,55 +87,79 @@ NoNewPrivileges=false
 [Install]
 WantedBy=multi-user.target
 UNIT
+
     systemctl daemon-reload
     systemctl enable --now sherlook-heal.service
 }
 
 main() {
     check_root
-    for c in curl jq install flock timeout pgrep pkill; do need_cmd "$c"; done
+
+    for c in curl jq install flock timeout pgrep pkill; do
+        need_cmd "$c"
+    done
+
     export DEBIAN_FRONTEND=noninteractive
+
     apt-get update -qq
-    apt-get install -y tor tor-geoipdb obfs4proxy curl jq openssl cron ca-certificates util-linux psmisc
+    apt-get install -y \
+        tor tor-geoipdb obfs4proxy curl jq openssl cron ca-certificates util-linux psmisc
 
     mkdir -p "$BASE_DIR" "$DATA_DIR" /root/.sherlook "$BASE_DIR/panel_tombstones"
     chown -R debian-tor:debian-tor "$DATA_DIR" 2>/dev/null || true
 
     local engine
+
     if [ -f "$LOCAL_ENGINE" ]; then
         engine="$LOCAL_ENGINE"
         echo -e "${CYAN}[*] Using local fixed engine: $engine${NC}"
     else
-        echo -e "${YELLOW}[!] Local fixed engine not found; fetching $SHERLOOK_REPO@$SHERLOOK_BRANCH.${NC}"
+        echo -e "${YELLOW}[!] Local fixed engine not found; fetching fixed engine from $SHERLOOK_REPO@$SHERLOOK_BRANCH.${NC}"
         engine=$(fetch_remote_engine)
     fi
 
     bash -n "$engine"
-    grep -q '^SHERLOOK_VERSION="7\.0\.0"$' "$engine" || { echo -e "${RED}[!] Engine version mismatch.${NC}"; exit 1; }
+
+    grep -q '^SHERLOOK_VERSION="7\.0\.0"$' "$engine" || {
+        echo -e "${RED}[!] Engine version mismatch.${NC}"
+        exit 1
+    }
+
     local backup=""
     if [ -f "$INSTALL_PATH" ]; then
         backup="$BASE_DIR/sherlook.sh.bak.$(date +%Y%m%d_%H%M%S)"
         cp -a "$INSTALL_PATH" "$backup"
+        echo -e "${CYAN}[i] Backup: $backup${NC}"
     fi
+
     install -m 755 "$engine" "$INSTALL_PATH.new"
     mv -f "$INSTALL_PATH.new" "$INSTALL_PATH"
     install -m 755 "$engine" /root/.sherlook/sherlook.sh
 
     # The package's default Tor daemon is not used by Sherlook's per-node torrcs.
     systemctl disable --now tor 2>/dev/null || true
+
     install_unit
+
     cat > /etc/cron.d/sherlook_watchdog <<CRON
 */15 * * * * root systemctl is-active --quiet sherlook-heal.service || systemctl restart sherlook-heal.service
 CRON
+
     chmod 644 /etc/cron.d/sherlook_watchdog
     systemctl restart cron 2>/dev/null || true
 
     local installed
     installed=$("$INSTALL_PATH" --version)
-    [ "$installed" = "$VERSION" ] || { echo -e "${RED}[!] Installed version check failed: $installed${NC}"; exit 1; }
-    echo -e "${GREEN}[+] Sherlook v$VERSION installed.${NC}"
-    [ -n "$backup" ] && echo -e "${CYAN}[i] Backup: $backup${NC}"
-    echo -e "${GREEN}[+] PasarGuard integration uses the current /api/core/{id} and /api/host/{id} ID-based API.${NC}"
+
+    [ "$installed" = "$VERSION" ] || {
+        echo -e "${RED}[!] Installed version check failed: $installed${NC}"
+        exit 1
+    }
+
+    echo -e "${GREEN}[+] Sherlook v$VERSION installed successfully.${NC}"
+    echo -e "${GREEN}[+] PasarGuard Batch Host remark fix is included.${NC}"
+    echo -e "${CYAN}[i] New nodes will use country flag + name, e.g. 🇩🇪 Germany.${NC}"
+    echo -e "${CYAN}[i] Panel integration: main menu option 9 → option 2.${NC}"
 }
 
 main "$@"
