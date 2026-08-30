@@ -2673,16 +2673,16 @@ panel_batch_create() {
             if [[ -z "${used_ports[$rand_port]:-}" && -z "${used_intags[$in_tag]:-}" && -z "${used_outtags[$out_tag]:-}" ]]; then break; fi
         done
         used_ports["$rand_port"]=1; used_intags["$in_tag"]=1; used_outtags["$out_tag"]=1
-        printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$idx" "$code" "$name" "$out_port" "$rand_port" "$in_tag" "$out_tag" >> "$add_tsv"
+        printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$idx" "$code" "$name" "$out_port" "$rand_port" "$in_tag" "$out_tag" "${EMOJIS[$code]:-🌐}" >> "$add_tsv"
     done
     [ -s "$add_tsv" ] || { echo -e "${YELLOW}[!] Nothing new to add.${NC}"; rm -f "$add_tsv"; panel_lock_release; trap - RETURN; return 0; }
     echo -e "\n${CYAN}⚙ Generating Core changes in one JSON pass...${NC}"
     jq -Rn --argjson tmpl "$clone_inbound_json" --argjson htmpl "$clone_host_json" --arg addr "$cloned_sni" '
-      [inputs | split("\t") | {idx:(.[0]|tonumber),code:.[1],name:.[2],remark:(.[1]+" "+.[2]),out_port:(.[3]|tonumber),in_port:(.[4]|tonumber),in_tag:.[5],out_tag:.[6]}] as $rows |
+      [inputs | split("\t") | {idx:(.[0]|tonumber),code:.[1],name:.[2],remark:((.[7] // "🌐")+" "+.[2]),out_port:(.[3]|tonumber),in_port:(.[4]|tonumber),in_tag:.[5],out_tag:.[6]}] as $rows |
       {inbounds:[$rows[] | . as $r | ($tmpl | .port=$r.in_port | .tag=$r.in_tag)],
        outbounds:[$rows[] | {tag:.out_tag,protocol:"socks",settings:{servers:[{address:"127.0.0.1",port:.out_port}]} }],
        routes:[$rows[] | {type:"field",inboundTag:[.in_tag],outboundTag:.out_tag}],
-       hosts:[$rows[] | . as $r | (if ($htmpl|type)=="object" and ($htmpl|length)>0 then ($htmpl | del(.id,.created_at,.updated_at,.enable) | .remark=$r.remark | .inbound_tag=$r.in_tag | .port=$r.in_port | .is_disabled=false | .priority=(.priority // $r.in_port)) else {remark:$r.name,inbound_tag:$r.in_tag,address:(if $addr=="" then [] else [$addr] end),port:$r.in_port,is_disabled:false,priority:$r.in_port} end)]}' < "$add_tsv" > "$additions"
+       hosts:[$rows[] | . as $r | (if ($htmpl|type)=="object" and ($htmpl|length)>0 then ($htmpl | del(.id,.created_at,.updated_at,.enable) | .remark=$r.remark | .inbound_tag=$r.in_tag | .port=$r.in_port | .is_disabled=false | .priority=(.priority // $r.in_port)) else {remark:$r.remark,inbound_tag:$r.in_tag,address:(if $addr=="" then [] else [$addr] end),port:$r.in_port,is_disabled:false,priority:$r.in_port} end)]}' < "$add_tsv" > "$additions"
     if ! jq --slurpfile a "$additions" '.inbounds += $a[0].inbounds | .outbounds += $a[0].outbounds | .routing=(.routing//{rules:[]}) | .routing.rules=((.routing.rules//[])+$a[0].routes)' "$CORE_FILE" > "$core_new"; then echo -e "${RED}[!] Generated Xray config is invalid JSON; nothing uploaded.${NC}"; panel_lock_release; trap - RETURN; return 1; fi
     if ! jq -e '(.inbounds|type=="array") and (.outbounds|type=="array") and (([.inbounds[].tag]|length)==([.inbounds[].tag]|unique|length))' "$core_new" >/dev/null; then echo -e "${RED}[!] Core validation failed (missing arrays or duplicate inbound tags).${NC}"; panel_lock_release; trap - RETURN; return 1; fi
     local original_core_name core_type exclude_tags fallback_tags
