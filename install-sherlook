@@ -26,14 +26,14 @@ LOCAL_ENGINE_2="$SCRIPT_DIR/sherlook.sh"
 
 check_root() {
     [ "$EUID" -eq 0 ] || {
-        echo -e "${RED}[!] این نصب‌کننده باید با root اجرا شود.${NC}"
+        echo -e "${RED}[!] This installer must be run as root.${NC}"
         exit 1
     }
 }
 
 need_cmd() {
     command -v "$1" >/dev/null 2>&1 || {
-        echo -e "${RED}[!] ابزار موردنیاز پیدا نشد: $1${NC}"
+        echo -e "${RED}[!] Required command not found: $1${NC}"
         exit 1
     }
 }
@@ -59,7 +59,7 @@ fetch_remote_engine() {
         jq -r '.sha // empty')
 
     [[ "$commit" =~ ^[0-9a-f]{40}$ ]] || {
-        echo -e "${RED}[!] دریافت commit شاخه $SHERLOOK_BRANCH ناموفق بود.${NC}"
+        echo -e "${RED}[!] Failed to resolve commit for branch $SHERLOOK_BRANCH.${NC}"
         exit 1
     }
 
@@ -68,7 +68,7 @@ fetch_remote_engine() {
 
     if ! curl -4 -fsSL --connect-timeout 10 --max-time 120 \
         -o "$tmp" "$remote"; then
-        echo -e "${RED}[!] دانلود engine از $remote ناموفق بود.${NC}"
+        echo -e "${RED}[!] Failed to download engine from $remote.${NC}"
         rm -f "$tmp"
         exit 1
     fi
@@ -78,8 +78,8 @@ fetch_remote_engine() {
     version=$(grep -m1 '^SHERLOOK_VERSION=' "$tmp" | sed 's/^SHERLOOK_VERSION="//; s/"$//')
 
     if [ "$version" != "$VERSION" ]; then
-        echo -e "${RED}[!] نسخهٔ remote برابر $VERSION نیست؛ نسخهٔ دریافت‌شده: ${version:-نامشخص}${NC}"
-        echo -e "${YELLOW}[i] برای نصب نسخهٔ محلی، فایل‌های installer و sherlook-${VERSION}.sh را کنار هم قرار بده.${NC}"
+        echo -e "${RED}[!] Remote version does not match $VERSION; received: ${version:-Unknown}${NC}"
+        echo -e "${YELLOW}[i] For local installation, place the installer and sherlook-${VERSION}.sh in the same directory.${NC}"
         rm -f "$tmp"
         exit 1
     fi
@@ -120,7 +120,7 @@ install_engine_file() {
 
     bash -n "$engine"
     grep -q '^SHERLOOK_VERSION="7\.1\.0"$' "$engine" || {
-        echo -e "${RED}[!] نسخهٔ engine باید 7.1.0 باشد.${NC}"
+        echo -e "${RED}[!] Engine version must be 7.1.0.${NC}"
         return 1
     }
 
@@ -134,8 +134,8 @@ install_engine_file() {
         old_version=$("$INSTALL_PATH" --version 2>/dev/null || echo "unknown")
         backup="$BASE_DIR/sherlook.sh.bak.$(date +%Y%m%d_%H%M%S)"
         cp -a "$INSTALL_PATH" "$backup"
-        echo -e "${CYAN}[i] نسخهٔ فعلی: $old_version${NC}"
-        echo -e "${CYAN}[i] پشتیبان: $backup${NC}"
+        echo -e "${CYAN}[i] Current version: $old_version${NC}"
+        echo -e "${CYAN}[i] Backup: $backup${NC}"
     fi
 
     staging="$INSTALL_PATH.new.$$"
@@ -151,12 +151,12 @@ install_engine_file() {
     systemctl enable sherlook-heal.service
 
     if ! systemctl restart sherlook-heal.service; then
-        echo -e "${RED}[!] اجرای سرویس جدید شکست خورد.${NC}"
+        echo -e "${RED}[!] The new service failed to start.${NC}"
         if [ -n "$backup" ] && [ -f "$backup" ]; then
             cp -a "$backup" "$INSTALL_PATH"
             systemctl daemon-reload
             systemctl restart sherlook-heal.service 2>/dev/null || true
-            echo -e "${YELLOW}[!] نسخهٔ قبلی بازیابی شد.${NC}"
+            echo -e "${YELLOW}[!] The previous version was restored.${NC}"
         fi
         return 1
     fi
@@ -164,12 +164,12 @@ install_engine_file() {
     local installed
     installed=$("$INSTALL_PATH" --version 2>/dev/null || true)
     if [ "$installed" != "$VERSION" ]; then
-        echo -e "${RED}[!] بررسی نسخه بعد از نصب شکست خورد: $installed${NC}"
+        echo -e "${RED}[!] Post-install version check failed: $installed${NC}"
         if [ -n "$backup" ] && [ -f "$backup" ]; then
             cp -a "$backup" "$INSTALL_PATH"
             systemctl daemon-reload
             systemctl restart sherlook-heal.service 2>/dev/null || true
-            echo -e "${YELLOW}[!] نسخهٔ قبلی بازیابی شد.${NC}"
+            echo -e "${YELLOW}[!] The previous version was restored.${NC}"
         fi
         return 1
     fi
@@ -180,9 +180,9 @@ CRON
     chmod 644 /etc/cron.d/sherlook_watchdog
     systemctl restart cron 2>/dev/null || true
 
-    echo -e "${GREEN}[+] Sherlook v$VERSION با موفقیت نصب/به‌روزرسانی شد.${NC}"
-    echo -e "${GREEN}[+] داده‌ها و تنظیمات نودهای قبلی حفظ شدند.${NC}"
-    echo -e "${GREEN}[+] پایش خودکار سلامت فعال است.${NC}"
+    echo -e "${GREEN}[+] Sherlook v$VERSION installed/updated successfully.${NC}"
+    echo -e "${GREEN}[+] Existing node data and settings were preserved.${NC}"
+    echo -e "${GREEN}[+] Automatic health monitoring is enabled.${NC}"
 }
 
 main() {
@@ -205,12 +205,12 @@ main() {
     local engine=""
     if [ -f "$LOCAL_ENGINE_1" ]; then
         engine="$LOCAL_ENGINE_1"
-        echo -e "${CYAN}[*] استفاده از engine محلی: $engine${NC}"
+        echo -e "${CYAN}[*] Using local engine: $engine${NC}"
     elif [ -f "$LOCAL_ENGINE_2" ]; then
         engine="$LOCAL_ENGINE_2"
-        echo -e "${CYAN}[*] استفاده از engine محلی: $engine${NC}"
+        echo -e "${CYAN}[*] Using local engine: $engine${NC}"
     else
-        echo -e "${YELLOW}[!] engine محلی پیدا نشد؛ دریافت نسخهٔ $VERSION از GitHub...${NC}"
+        echo -e "${YELLOW}[!] Local engine not found; downloading v$VERSION from GitHub...${NC}"
         engine=$(fetch_remote_engine)
     fi
 
