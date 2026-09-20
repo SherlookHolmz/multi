@@ -833,14 +833,14 @@ node_socks_ready() {
 
 health_reason_fa() {
     case "${1:-}" in
-        VERIFIED:*) printf 'موقعیت تأیید شد (%s)' "${1#VERIFIED:}" ;;
-        LIVE_LOCAL) printf '%s' 'اتصال محلی برقرار است' ;;
-        GEOIP_UNAVAILABLE) printf '%s' 'سرویس تشخیص موقعیت موقتاً در دسترس نیست' ;;
-        COUNTRY_MISMATCH) printf '%s' 'کشور IP با مسیر انتخاب‌شده متفاوت است' ;;
-        GEOIP_CONFLICT) printf '%s' 'نتیجهٔ تشخیص موقعیت متناقض است' ;;
-        HIGH_RISK) printf '%s' 'IP پرریسک تشخیص داده شد' ;;
-        SOCKS_UNREACHABLE) printf '%s' 'پورت SOCKS در دسترس نیست' ;;
-        PROCESS_DOWN) printf '%s' 'پردازش Tor خاموش است' ;;
+        VERIFIED:*) printf 'Location verified (%s)' "${1#VERIFIED:}" ;;
+        LIVE_LOCAL) printf '%s' 'Local connection is available' ;;
+        GEOIP_UNAVAILABLE) printf '%s' 'GeoIP service is temporarily unavailable' ;;
+        COUNTRY_MISMATCH) printf '%s' 'IP country does not match the selected route' ;;
+        GEOIP_CONFLICT) printf '%s' 'Conflicting GeoIP results' ;;
+        HIGH_RISK) printf '%s' 'High-risk IP detected' ;;
+        SOCKS_UNREACHABLE) printf '%s' 'SOCKS port is unreachable' ;;
+        PROCESS_DOWN) printf '%s' 'Tor process is down' ;;
         *) printf '%s' "${1:--}" ;;
     esac
 }
@@ -1321,16 +1321,16 @@ panel_auth_preflight() {
     rm -f "$tmp"
     case "$code" in
         200) return 0 ;;
-        401) echo -e "${YELLOW}[!] نشست پنل منقضی شده است؛ دوباره وارد شوید.${NC}" >&2; return 2 ;;
-        403) echo -e "${RED}[!] توکن دسترسی خواندن Core را ندارد (HTTP 403).${NC}" >&2; return 1 ;;
+        401) echo -e "${YELLOW}[!] Panel session expired; please log in again.${NC}" >&2; return 2 ;;
+        403) echo -e "${RED}[!] The token does not have Core read permission (HTTP 403).${NC}" >&2; return 1 ;;
         000)
-            echo -e "${RED}[!] اتصال به پنل برقرار نشد.${NC}" >&2
+            echo -e "${RED}[!] Could not connect to the panel.${NC}" >&2
             if [ -s "$PANEL_ERROR_LOG" ]; then
-                echo -e "${YELLOW}جزئیات شبکه/TLS:${NC} $(tr '\n' ' ' < "$PANEL_ERROR_LOG" | cut -c1-260)" >&2
+                echo -e "${YELLOW}Network/TLS details:${NC} $(tr '\n' ' ' < "$PANEL_ERROR_LOG" | cut -c1-260)" >&2
             fi
             return 1
             ;;
-        *) echo -e "${RED}[!] پاسخ غیرمنتظره از پنل: HTTP $code${NC}" >&2; return 1 ;;
+        *) echo -e "${RED}[!] Unexpected panel response: HTTP $code${NC}" >&2; return 1 ;;
     esac
 }
 
@@ -1345,7 +1345,7 @@ panel_core_fetch() {
 
     code=$(panel_request GET /api/cores "" "$list_file")
     if [ "$code" != "200" ] || ! jq -e 'type=="object" and (.cores|type=="array")' "$list_file" >/dev/null 2>&1; then
-        echo -e "${RED}[!] دریافت فهرست Coreها ناموفق بود: HTTP $code${NC}" >&2
+        echo -e "${RED}[!] Failed to fetch Core list: HTTP $code${NC}" >&2
         if [ "$code" = "000" ] && [ -s "$PANEL_ERROR_LOG" ]; then
             tail -n 5 "$PANEL_ERROR_LOG" >&2
         fi
@@ -1358,7 +1358,7 @@ panel_core_fetch() {
         if jq -e --arg wanted "$configured" 'any(.cores[]?; (.id|tostring)==$wanted)' "$list_file" >/dev/null 2>&1; then
             core_id="$configured"
         else
-            echo -e "${RED}[!] Core ذخیره‌شده با شناسه ${configured} پیدا نشد؛ برای جلوگیری از تغییر Core اشتباه، عملیات متوقف شد.${NC}" >&2
+            echo -e "${RED}[!] Configured Core ID ${configured} was not found; aborting to prevent modifying the wrong Core.${NC}" >&2
             rm -f "$list_file" "$detail_file"
             return 1
         fi
@@ -1367,14 +1367,14 @@ panel_core_fetch() {
     fi
 
     if [[ ! "$core_id" =~ ^[0-9]+$ ]]; then
-        echo -e "${RED}[!] هیچ Coreای در پنل پیدا نشد.${NC}" >&2
+        echo -e "${RED}[!] No Core was found in the panel.${NC}" >&2
         rm -f "$list_file" "$detail_file"
         return 1
     fi
 
     code=$(panel_request GET "/api/core/$core_id" "" "$detail_file")
     if [ "$code" != "200" ] || ! jq -e 'type=="object" and (.config|type=="object")' "$detail_file" >/dev/null 2>&1; then
-        echo -e "${RED}[!] دریافت Core #$core_id ناموفق بود: HTTP $code${NC}" >&2
+        echo -e "${RED}[!] Failed to fetch Core #$core_id: HTTP $code${NC}" >&2
         [ "$code" = "000" ] && [ -s "$PANEL_ERROR_LOG" ] && tail -n 5 "$PANEL_ERROR_LOG" >&2 || true
         rm -f "$list_file" "$detail_file"
         return 1
@@ -1766,7 +1766,7 @@ draw_header() {
     echo -e "${MAGENTA} ╚════════════════════════════════════════════════════════╝${NC}"
     local live_frame="${UI_SPINNER_FRAMES[$UI_SPINNER_INDEX]}"
     UI_SPINNER_INDEX=$(( (UI_SPINNER_INDEX + 1) % ${#UI_SPINNER_FRAMES[@]} ))
-    echo -e " ${CYAN}${live_frame}${NC} ${WHITE}Sherlook 7.1.0${NC} ${YELLOW}|${NC} پایش زنده ${CYAN}•${NC} بررسی کشور و IP ${GREEN}●${NC}"
+    echo -e " ${CYAN}${live_frame}${NC} ${WHITE}Sherlook 7.1.0${NC} ${YELLOW}|${NC} LIVE MONITOR ${CYAN}•${NC} country/IP verification ${GREEN}●${NC}"
     if [ -n "${PANEL_PENDING_FILE:-}" ] && [ -s "${PANEL_PENDING_FILE:-/nonexistent}" ]; then
         local pend_n; pend_n=$(wc -l < "$PANEL_PENDING_FILE" | tr -d ' ')
         [ "$pend_n" != "0" ] && echo -e " ${YELLOW}⚠${NC}  ${YELLOW}${pend_n} node(s) waiting on a Panel cleanup retry${NC} ${WHITE}(Edit/Delete Nodes → option 5)${NC}"
@@ -2573,14 +2573,14 @@ bulk_add_nodes() {
 
 health_status_fa() {
     case "${1:-UNKNOWN}" in
-        ONLINE) printf '%s' 'سالم و تأییدشده' ;;
-        ONLINE_UNVERIFIED) printf '%s' 'سالم، بدون تأیید موقعیت' ;;
-        EXIT_GEOIP_FAIL) printf '%s' 'موقعیت IP نامعتبر' ;;
-        DEAD) printf '%s' 'پردازش خاموش' ;;
-        SOCKS_DEAD) printf '%s' 'اتصال خروجی قطع' ;;
-        QUARANTINED*) printf '%s' 'قرنطینه موقت' ;;
-        STALE) printf '%s' 'دادهٔ سلامت قدیمی' ;;
-        *) printf '%s' 'نامشخص' ;;
+        ONLINE) printf '%s' 'Healthy and verified' ;;
+        ONLINE_UNVERIFIED) printf '%s' 'Healthy, location unverified' ;;
+        EXIT_GEOIP_FAIL) printf '%s' 'Invalid IP location' ;;
+        DEAD) printf '%s' 'Process is down' ;;
+        SOCKS_DEAD) printf '%s' 'Outbound connection is down' ;;
+        QUARANTINED*) printf '%s' 'Temporarily quarantined' ;;
+        STALE) printf '%s' 'Stale health data' ;;
+        *) printf '%s' 'Unknown' ;;
     esac
 }
 
@@ -2597,7 +2597,7 @@ health_status_symbol() {
 
 render_active_nodes() {
     local idx code name out_port status ip bootstrap reason updated age symbol
-    printf '%-4s %-4s %-20s %-7s %-25s %-17s %-10s\n' 'شناسه' 'کشور' 'موقعیت' 'پورت' 'وضعیت' 'IP خروجی' 'تازه‌سازی'
+    printf '%-4s %-4s %-20s %-7s %-25s %-17s %-10s\n' 'ID' 'Country' 'Location' 'Port' 'Status' 'Exit IP' 'Refresh'
     echo '────────────────────────────────────────────────────────────────────────────────────────────'
     for idx in "${ORDER[@]}"; do
         IFS=':' read -r code name out_port <<< "${NODES[$idx]}"
@@ -2630,12 +2630,12 @@ view_active_nodes() {
     local probe_pid='' last_probe=0 key now
     while true; do
         draw_header
-        echo -e "${CYAN}» پایش زنده نودها${NC}"
-        echo -e "${YELLOW}● داده‌های جدول از آخرین بررسی سلامت خوانده می‌شوند؛ صفحه هر ${LIVE_REFRESH_INTERVAL} ثانیه خودکار تازه می‌شود.${NC}"
+        echo -e "${CYAN}» LIVE NODE MONITOR${NC}"
+        echo -e "${YELLOW}● Table data comes from the latest health check; the screen refreshes every ${LIVE_REFRESH_INTERVAL} seconds.${NC}"
         if systemctl is-active --quiet sherlook-heal.service 2>/dev/null; then
-            echo -e "${GREEN}سرویس پایش خودکار فعال است.${NC} ${WHITE}کلید R = بررسی فوری، Q = بازگشت${NC}\n"
+            echo -e "${GREEN}Auto-heal service is active.${NC} ${WHITE}R = force check, Q = back${NC}\n"
         else
-            echo -e "${YELLOW}سرویس پایش خودکار خاموش است.${NC} ${WHITE}کلید R = بررسی سلامت بدون تعمیر، Q = بازگشت${NC}\n"
+            echo -e "${YELLOW}Auto-heal service is inactive.${NC} ${WHITE}R = health check without repair, Q = back${NC}\n"
             now=$(date +%s)
             if { [[ -z "$probe_pid" ]] || ! kill -0 "$probe_pid" 2>/dev/null; } && (( now - last_probe >= 15 )); then
                 background_auto_heal 0 0 >/dev/null 2>&1 &
@@ -2645,8 +2645,8 @@ view_active_nodes() {
         fi
         render_active_nodes
         echo
-        echo -e "${GREEN}●${NC} سالم   ${CYAN}◐${NC} سالم ولی موقعیت تأیید نشده   ${RED}✗${NC} مشکل‌دار   ${YELLOW}!${NC} قرنطینه"
-        echo -e "${WHITE}R${NC}=بررسی فوری   ${WHITE}Q${NC}=بازگشت   ${WHITE}۰${NC}=بازگشت"
+        echo -e "${GREEN}●${NC} Healthy   ${CYAN}◐${NC} Healthy, Location unverified   ${RED}✗${NC} unhealthy   ${YELLOW}!${NC} quarantined"
+        echo -e "${WHITE}R${NC}=force check   ${WHITE}Q${NC}=back   ${WHITE}0${NC}=back"
         if read -r -n 1 -t "$LIVE_REFRESH_INTERVAL" key < /dev/tty; then
             echo
             case "${key,,}" in
@@ -2743,24 +2743,24 @@ panel_login() {
     fi
 
     local p_domain p_port p_user p_pass base_url token_resp token auth_code
-    read -r -p 'آدرس پنل (مثال: https://panel.example.com): ' p_domain < /dev/tty || return
-    read -r -p 'پورت پنل [443]: ' p_port < /dev/tty || return
+    read -r -p 'Panel URL (example: https://panel.example.com): ' p_domain < /dev/tty || return
+    read -r -p 'Panel port [443]: ' p_port < /dev/tty || return
     [ -n "$p_port" ] || p_port=443
 
     if [[ "$p_domain" =~ ^https?:// ]]; then
         base_url=$(normalize_panel_url "$p_domain") || {
-            echo -e "${RED}[!] آدرس پنل نامعتبر است.${NC}"
+            echo -e "${RED}[!] Invalid panel URL.${NC}"
             return 1
         }
     else
         base_url=$(normalize_panel_url "https://${p_domain}:${p_port}") || {
-            echo -e "${RED}[!] دامنه یا پورت پنل نامعتبر است.${NC}"
+            echo -e "${RED}[!] Invalid panel host or port.${NC}"
             return 1
         }
     fi
 
-    read -r -p 'نام کاربری مدیر: ' p_user < /dev/tty || return
-    read -r -s -p 'رمز عبور مدیر: ' p_pass < /dev/tty || return
+    read -r -p 'Admin username: ' p_user < /dev/tty || return
+    read -r -s -p 'Admin password: ' p_pass < /dev/tty || return
     echo
 
     token_resp=$(mktemp /tmp/sherlook-panel-token.XXXXXX) || return 1
@@ -2768,9 +2768,9 @@ panel_login() {
     token=$(jq -r '.access_token // empty' "$token_resp" 2>/dev/null || true)
 
     if [ -z "$token" ]; then
-        echo -e "${RED}[!] ورود به پنل ناموفق بود (HTTP $auth_code).${NC}"
+        echo -e "${RED}[!] Panel login failed (HTTP $auth_code).${NC}"
         if [ "$auth_code" = "000" ] && [ -s "$PANEL_ERROR_LOG" ]; then
-            echo -e "${YELLOW}جزئیات اتصال:${NC}"
+            echo -e "${YELLOW}Connection details:${NC}"
             tail -n 5 "$PANEL_ERROR_LOG"
         else
             jq -r '.detail // .message // empty' "$token_resp" 2>/dev/null | head -n 3
@@ -2792,10 +2792,10 @@ panel_login() {
     panel_conf_write
 
     if ! panel_auth_preflight; then
-        echo -e "${RED}[!] ورود موفق بود ولی دسترسی خواندن Coreها وجود ندارد. سطح دسترسی مدیر را بررسی کن.${NC}"
+        echo -e "${RED}[!] Login succeeded, but Core read access is unavailable. Check the admin permissions.${NC}"
         return 1
     fi
-    echo -e "${GREEN}[+] اتصال به پنل با موفقیت برقرار شد.${NC}"
+    echo -e "${GREEN}[+] Connected to the panel successfully.${NC}"
     panel_menu
 }
 
@@ -2803,27 +2803,27 @@ panel_login() {
 panel_diagnostics() {
     check_root
     draw_header
-    echo -e "${MAGENTA}📡 عیب‌یابی اتصال پنل${NC}"
+    echo -e "${MAGENTA}📡 Panel connection diagnostics${NC}"
     echo '────────────────────────────────────────────────────────────'
 
     if ! panel_conf_safe_load || [ -z "${URL:-}" ] || [ -z "${TOKEN:-}" ]; then
-        echo -e "${YELLOW}⚠ هنوز اتصال پنل تنظیم نشده است. از گزینه 9 ابتدا وارد پنل شو.${NC}"
-        read -r -p 'Enter برای بازگشت...' < /dev/tty
+        echo -e "${YELLOW}⚠ Panel connection is not configured yet. Use option 9 to log in first.${NC}"
+        read -r -p 'Press Enter to go back...' < /dev/tty
         return 1
     fi
 
     URL=$(normalize_panel_url "$URL") || {
-        echo -e "${RED}✗ آدرس ذخیره‌شده پنل نامعتبر است.${NC}"
-        read -r -p 'Enter برای بازگشت...' < /dev/tty
+        echo -e "${RED}✗ Saved panel URL is invalid.${NC}"
+        read -r -p 'Press Enter to go back...' < /dev/tty
         return 1
     }
     panel_conf_write
 
-    echo -e "${CYAN}آدرس پنل:${NC} $URL"
+    echo -e "${CYAN}Panel URL:${NC} $URL"
     if [ "${PANEL_INSECURE_TLS:-0}" = "1" ]; then
-        echo -e "${YELLOW}TLS: بررسی گواهی غیرفعال است.${NC}"
+        echo -e "${YELLOW}TLS: certificate verification is disabled.${NC}"
     else
-        echo -e "${GREEN}TLS: بررسی گواهی فعال است.${NC}"
+        echo -e "${GREEN}TLS: certificate verification is enabled.${NC}"
     fi
 
     local tmp code core_file="$BASE_DIR/diagnose_core.json" core_id="" host_count
@@ -2831,31 +2831,31 @@ panel_diagnostics() {
 
     code=$(panel_request GET /api/cores "" "$tmp")
     if [ "$code" = "200" ] && jq -e '.cores|type=="array"' "$tmp" >/dev/null 2>&1; then
-        echo -e "${GREEN}✓ ارتباط API برقرار است.${NC}"
-        echo -e "${GREEN}✓ تعداد Coreها: $(jq '.cores|length' "$tmp")${NC}"
+        echo -e "${GREEN}✓ API connection is working.${NC}"
+        echo -e "${GREEN}✓ Core count: $(jq '.cores|length' "$tmp")${NC}"
     else
-        echo -e "${RED}✗ دریافت Coreها شکست خورد — HTTP $code${NC}"
+        echo -e "${RED}✗ Failed to fetch Cores — HTTP $code${NC}"
         [ "$code" = "000" ] && [ -s "$PANEL_ERROR_LOG" ] && tail -n 8 "$PANEL_ERROR_LOG"
         rm -f "$tmp"
-        read -r -p 'Enter برای بازگشت...' < /dev/tty
+        read -r -p 'Press Enter to go back...' < /dev/tty
         return 1
     fi
 
     if panel_core_fetch "$core_file"; then
         core_id="${PANEL_CORE_ID:-}"
-        echo -e "${GREEN}✓ Core #$core_id با موفقیت خوانده شد.${NC}"
-        echo -e "${GREEN}✓ ساختار Core معتبر است.${NC}"
+        echo -e "${GREEN}✓ Core #$core_id loaded successfully.${NC}"
+        echo -e "${GREEN}✓ Core structure is valid.${NC}"
         rm -f "$core_file"
     else
-        echo -e "${RED}✗ دریافت Core انتخاب‌شده شکست خورد.${NC}"
+        echo -e "${RED}✗ Failed to fetch the selected Core.${NC}"
     fi
 
     code=$(panel_request GET /api/hosts "" "$tmp")
     if [ "$code" = "200" ] && jq -e 'type=="array"' "$tmp" >/dev/null 2>&1; then
         host_count=$(jq 'length' "$tmp")
-        echo -e "${GREEN}✓ دسترسی Host برقرار است — $host_count Host${NC}"
+        echo -e "${GREEN}✓ Host access is working — $host_count Host(s)${NC}"
     else
-        echo -e "${RED}✗ دریافت Hostها شکست خورد — HTTP $code${NC}"
+        echo -e "${RED}✗ Failed to fetch Hosts — HTTP $code${NC}"
     fi
 
     local installed=0 idx details code2 name2 out_port2
@@ -2864,37 +2864,37 @@ panel_diagnostics() {
         IFS=':' read -r code2 name2 out_port2 <<< "$details"
         [ -f "$BASE_DIR/node_${code2}_${out_port2}.conf" ] && installed=$((installed+1))
     done
-    echo -e "${CYAN}تعداد نودهای محلی:${NC} $installed"
-    echo -e "${WHITE}این تست هیچ Core یا Host جدیدی نمی‌سازد و هیچ داده‌ای را حذف نمی‌کند.${NC}"
+    echo -e "${CYAN}Local node count:${NC} $installed"
+    echo -e "${WHITE}This test does not create new Cores or Hosts and does not delete any data.${NC}"
 
     rm -f "$tmp" "$core_file"
-    read -r -p 'Enter برای بازگشت...' < /dev/tty
+    read -r -p 'Press Enter to go back...' < /dev/tty
 }
 panel_menu() {
     while true; do
         draw_header
-        echo -e "📌 ${MAGENTA}[ اتصال و مدیریت PasarGuard ]${NC}"
+        echo -e "📌 ${MAGENTA}[ PasarGuard Connection & Management ]${NC}"
         local pend; pend=$(panel_pending_queue_count)
-        echo '[1] تنظیم / اعتبارسنجی الگوها'
-        echo '[2] افزودن نودهای نصب‌شده به پنل'
-        echo '[3] حذف نودهای انتخابی از پنل'
-        [ "$pend" != "0" ] && echo -e "[5] ${YELLOW}تلاش مجدد پاک‌سازی معوق (${pend})${NC}"
-        echo '[6] عیب‌یابی اتصال پنل'
-        echo '[4] خروج از حساب پنل'
-        echo '[0] بازگشت'
-        read -r -p 'انتخاب: ' panel_opt < /dev/tty || return
+        echo '[1] Configure / validate templates'
+        echo '[2] Add installed nodes to panel'
+        echo '[3] Remove selected nodes from panel'
+        [ "$pend" != "0" ] && echo -e "[5] ${YELLOW}Retry pending cleanup (${pend})${NC}"
+        echo '[6] Panel connection diagnostics'
+        echo '[4] Log out from panel'
+        echo '[0] back'
+        read -r -p 'Choice: ' panel_opt < /dev/tty || return
 
         case "$panel_opt" in
             1)
                 panel_prepare_templates
-                read -r -p 'Enter برای ادامه...' < /dev/tty
+                read -r -p 'Press Enter to continue...' < /dev/tty
                 ;;
             2)
                 panel_batch_create
-                read -r -p 'Enter برای ادامه...' < /dev/tty
+                read -r -p 'Press Enter to continue...' < /dev/tty
                 ;;
             3)
-                read -r -p 'شناسه نودها: ' s < /dev/tty || continue
+                read -r -p 'Node IDs:  ' s < /dev/tty || continue
                 mapfile -t ids < <(
                     printf '%s\n' "$s" |
                     sed 's/;/,/g' |
@@ -2915,9 +2915,9 @@ panel_menu() {
                     [ "$rc" = "0" ] && panel_pending_queue_remove "${ids[@]}"
                     [ "$rc" = "2" ] && panel_pending_queue_add "core-ok-hosts-unconfirmed" "${ids[@]}"
                 else
-                    echo -e "${YELLOW}شناسهٔ معتبری انتخاب نشد.${NC}"
+                    echo -e "${YELLOW}No valid IDs were selected.${NC}"
                 fi
-                read -r -p 'Enter برای ادامه...' < /dev/tty
+                read -r -p 'Press Enter to continue...' < /dev/tty
                 ;;
             5)
                 [ "$pend" != "0" ] && panel_pending_queue_show_and_retry
@@ -2928,7 +2928,7 @@ panel_menu() {
             4)
                 rm -f "$PANEL_CONF"
                 unset URL USER TOKEN
-                echo -e "${GREEN}[+] از حساب پنل خارج شدی.${NC}"
+                echo -e "${GREEN}[+] Logged out from the panel.${NC}"
                 return
                 ;;
             0) return ;;
@@ -3000,7 +3000,7 @@ panel_sync_single() {
         '{name:$name,config:$config[0],type:$type,exclude_inbound_tags:$ex,fallbacks_inbound_tags:$fb}' > "$core_payload"
     local http; http=$(panel_request PUT "/api/core/${PANEL_CORE_ID}?restart_nodes=true" "$core_payload" "$response")
     if ! panel_http_ok "$http"; then
-        echo -e "${RED}[!] همگام‌سازی Core با پنل شکست خورد: HTTP $http${NC}"
+        echo -e "${RED}[!] Core synchronization failed: HTTP $http${NC}"
         jq -r '.detail // .' "$response" 2>/dev/null | head -n 12 >&2
         panel_lock_release; trap - RETURN; return 1
     fi
@@ -3013,7 +3013,7 @@ panel_sync_single() {
             any(.config.outbounds[]?; .tag==$out) and
             any(.config.routing.rules[]?.inboundTag[]?; .==$in) and
             any(.config.routing.rules[]?.outboundTag?; .==$out)' "$verify" >/dev/null 2>&1; then
-            echo -e "${RED}[!] پنل Core را پذیرفت اما وجود Inbound/Outbound جدید قابل تأیید نیست؛ Host ساخته نمی‌شود.${NC}"
+            echo -e "${RED}[!] The panel accepted the Core, but the new inbound/outbound entries could not be verified; Hosts will not be created.${NC}"
             rm -f "$verify" "$additions" "$core_payload" "$response" "$BASE_DIR/panel_sync_core.json"
             panel_lock_release; trap - RETURN; return 2
         fi
@@ -3027,9 +3027,9 @@ panel_sync_single() {
         if [ -n "$host_id" ]; then echo -e "${YELLOW}[~] Host already existed; reconciled it to ID $host_id.${NC}"; fi
     fi
     if ! [[ "$host_id" =~ ^[0-9]+$ ]]; then
-        echo -e "${RED}[!] ساخت Host شکست خورد (HTTP $http). پاسخ پنل:${NC}"
+        echo -e "${RED}[!] Host creation failed (HTTP $http). Panel response:${NC}"
         jq -r '.detail // .message // .' "$response" 2>/dev/null | head -n 14 >&2
-        echo -e "${YELLOW}[!] حالا Core به وضعیت قبل برگردانده می‌شود.${NC}"
+        echo -e "${YELLOW}[!] The Core will now be rolled back to its previous state.${NC}"
         local rollback="$BASE_DIR/panel_sync_rollback.json" rollback_code
         jq -n --arg name "$original_core_name" --argjson config "$(cat "$core_file")" --argjson type "$core_type" --argjson ex "$exclude_tags" --argjson fb "$fallback_tags" '{name:$name,config:$config,type:$type,exclude_inbound_tags:$ex,fallbacks_inbound_tags:$fb}' > "$rollback"
         rollback_code=$(panel_request PUT "/api/core/${PANEL_CORE_ID}?restart_nodes=true" "$rollback" "$response")
@@ -3184,31 +3184,31 @@ fi
 toggle_auto_heal() {
     check_root
     draw_header
-    echo -e "📌 ${MAGENTA}[ پایش خودکار سلامت ]${NC}\n"
+    echo -e "📌 ${MAGENTA}[ AUTO-HEAL SERVICE ]${NC}\n"
     if systemctl is-active --quiet sherlook-heal.service 2>/dev/null; then
-        echo -e "${GREEN}پایش خودکار فعال است.${NC}"
-        echo -e "${YELLOW}[!] نودهای ناسالم را متوقف و دوباره راه‌اندازی می‌کند.${NC}"
-        echo -e "${YELLOW}    علت‌ها: خاموشی Tor، قطع SOCKS یا موقعیت اشتباه IP.${NC}\n"
-        echo -e "  ${CYAN}[1]${NC} توقف تا پایان این بوت"
-        echo -e "  ${CYAN}[2]${NC} توقف و غیرفعال‌سازی دائمی"
-        echo -e "  ${RED}[0]${NC} بازگشت بدون تغییر"
-        read -r -p "انتخاب [0-2]: " ah_choice < /dev/tty || return
-        case "$ah_choice" in
-            1) systemctl stop sherlook-heal.service; echo -e "${GREEN}[+] متوقف شد؛ بعد از راه‌اندازی مجدد دوباره فعال می‌شود.${NC}" ;;
-            2) systemctl disable --now sherlook-heal.service; echo -e "${GREEN}[+] متوقف و غیرفعال شد؛ خودکار فعال نمی‌شود.${NC}" ;;
-            *) echo -e "${CYAN}[*] تغییری اعمال نشد.${NC}" ;;
-        esac
-    else
-        echo -e "${YELLOW}پایش خودکار خاموش است.${NC}"
-        echo -e "${CYAN}[!] نودهای خراب یا خارج از کشور انتخاب‌شده خودکار تعمیر نمی‌شوند.${NC}"
-        echo -e "${CYAN}    برای تعویض دستی IP از گزینه [8] استفاده کن.${NC}\n"
-        echo -e "  ${CYAN}[1]${NC} فعال‌سازی و اجرای خودکار"
-        echo -e "  ${CYAN}[2]${NC} اجرای موقت تا پایان این بوت"
-        echo -e "  ${RED}[0]${NC} بازگشت بدون تغییر"
+        echo -e "${GREEN}Auto-heal is active.${NC}"
+        echo -e "${YELLOW}[!] It stops and restarts unhealthy nodes.${NC}"
+        echo -e "${YELLOW}    Reasons: Tor down, SOCKS unreachable, or incorrect IP Location.${NC}\n"
+        echo -e "  ${CYAN}[1]${NC} Stop until the next reboot"
+        echo -e "  ${CYAN}[2]${NC} Stop and disable permanently"
+        echo -e "  ${RED}[0]${NC} back without changes"
         read -r -p "Choice [0-2]: " ah_choice < /dev/tty || return
         case "$ah_choice" in
-            1) systemctl enable --now sherlook-heal.service; echo -e "${GREEN}[+] فعال و اجرا شد.${NC}" ;;
-            2) systemctl start sherlook-heal.service; echo -e "${GREEN}[+] فقط برای این بوت اجرا شد.${NC}" ;;
+            1) systemctl stop sherlook-heal.service; echo -e "${GREEN}[+] Stopped; it will start again after reboot.${NC}" ;;
+            2) systemctl disable --now sherlook-heal.service; echo -e "${GREEN}[+] Stopped and disabled; it will not start automatically.${NC}" ;;
+            *) echo -e "${CYAN}[*] No changes made.${NC}" ;;
+        esac
+    else
+        echo -e "${YELLOW}Auto-heal is inactive.${NC}"
+        echo -e "${CYAN}[!] Broken or out-of-country nodes will not be repaired automatically.${NC}"
+        echo -e "${CYAN}    Use option [8] for manual IP rotation.${NC}\n"
+        echo -e "  ${CYAN}[1]${NC} Enable and start automatically"
+        echo -e "  ${CYAN}[2]${NC} Run until the next reboot"
+        echo -e "  ${RED}[0]${NC} back without changes"
+        read -r -p "Choice [0-2]: " ah_choice < /dev/tty || return
+        case "$ah_choice" in
+            1) systemctl enable --now sherlook-heal.service; echo -e "${GREEN}[+] Enabled and started.${NC}" ;;
+            2) systemctl start sherlook-heal.service; echo -e "${GREEN}[+] Started for this boot only.${NC}" ;;
             *) echo -e "${CYAN}[*] No change.${NC}" ;;
         esac
     fi
@@ -3219,33 +3219,33 @@ while true; do
     draw_header
     if command -v tor &> /dev/null && command -v jq &> /dev/null; then
         if systemctl is-active --quiet sherlook-heal.service 2>/dev/null; then
-            echo -e "   ${WHITE}وضعیت سیستم:${NC} ${GREEN}آماده + پایش خودکار فعال${NC}"
+            echo -e "   ${WHITE}System status:${NC} ${GREEN}Ready + auto-heal active${NC}"
         else
-            echo -e "   ${WHITE}وضعیت سیستم:${NC} ${GREEN}آماده${NC} ${YELLOW}(پایش خودکار خاموش)${NC}"
+            echo -e "   ${WHITE}System status:${NC} ${GREEN}Ready${NC} ${YELLOW}(auto-heal inactive)${NC}"
         fi
     else
-        echo -e "   ${WHITE}وضعیت سیستم:${NC} ${RED}نا آماده${NC}"
+        echo -e "   ${WHITE}System status:${NC} ${RED}Not ready${NC}"
     fi
     echo -e "${BLUE} ────────────────────────────────────────────────────────${NC}"
-    echo -e "  ${CYAN}[1]${NC} ${WHITE}»${NC} نصب موتور و ابزارهای موردنیاز"
-    echo -e "  ${CYAN}[2]${NC} ${WHITE}»${NC} بروزرسانی آنلاین"
-    echo -e "  ${CYAN}[3]${NC} ${WHITE}»${NC} حذف کامل سیستم"
+    echo -e "  ${CYAN}[1]${NC} ${WHITE}»${NC} Install engine and required tools"
+    echo -e "  ${CYAN}[2]${NC} ${WHITE}»${NC} Online update"
+    echo -e "  ${CYAN}[3]${NC} ${WHITE}»${NC} Uninstall system"
     echo -e "${BLUE} ────────────────────────────────────────────────────────${NC}"
-    echo -e "  ${GREEN}[4]${NC} ${WHITE}»${NC} ساخت نود یک کشور"
-    echo -e "  ${GREEN}[5]${NC} ${WHITE}»${NC} ساخت گروهی نودها"
-    echo -e "  ${GREEN}[6]${NC} ${WHITE}»${NC} نمایش زنده نودها"
-    echo -e "  ${GREEN}[7]${NC} ${WHITE}»${NC} ویرایش / حذف نودها"
-    echo -e "  ${CYAN}[8]${NC} ${WHITE}»${NC} 🔄 تعویض IP"
-    echo -e "  ${CYAN}[A]${NC} ${WHITE}»${NC} روشن / خاموش کردن پایش خودکار"
+    echo -e "  ${GREEN}[4]${NC} ${WHITE}»${NC} Add location node"
+    echo -e "  ${GREEN}[5]${NC} ${WHITE}»${NC} Bulk add nodes"
+    echo -e "  ${GREEN}[6]${NC} ${WHITE}»${NC} Live node monitor"
+    echo -e "  ${GREEN}[7]${NC} ${WHITE}»${NC} Edit / delete nodes"
+    echo -e "  ${CYAN}[8]${NC} ${WHITE}»${NC} 🔄 IP rotation"
+    echo -e "  ${CYAN}[A]${NC} ${WHITE}»${NC} Toggle auto-heal"
     echo -e "${BLUE} ────────────────────────────────────────────────────────${NC}"
-    echo -e "  ${CYAN}[D]${NC} ${WHITE}»${NC} عیب‌یابی سیستم و پنل"
-    echo -e "  ${YELLOW}[9]${NC} ${WHITE}»${NC} اتصال و مدیریت PasarGuard"
+    echo -e "  ${CYAN}[D]${NC} ${WHITE}»${NC} System & panel diagnostics"
+    echo -e "  ${YELLOW}[9]${NC} ${WHITE}»${NC} PasarGuard connection & management"
     echo -e "${BLUE} ────────────────────────────────────────────────────────${NC}"
-    echo -e "  ${RED}[0]${NC} ${WHITE}»${NC} خروج"
+    echo -e "  ${RED}[0]${NC} ${WHITE}»${NC} Exit"
     echo -e "${BLUE} ────────────────────────────────────────────────────────${NC}\n"
 
-    if ! read -r -p "$(echo -e ${MAGENTA}"انتخاب [0-9/A/D]: "${NC})" main_choice < /dev/tty; then
-        echo -e "\n${RED}[!] ورودی ترمینال در دسترس نیست؛ اجرای برنامه متوقف شد.${NC}"
+    if ! read -r -p "$(echo -e ${MAGENTA}"Choice [0-9/A/D]: "${NC})" main_choice < /dev/tty; then
+        echo -e "\n${RED}[!] Terminal input is unavailable; exiting.${NC}"
         exit 1
     fi
 
